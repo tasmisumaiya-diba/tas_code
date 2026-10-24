@@ -1,0 +1,3 @@
+# from-language<TAB>to-language<TAB>source-callee<TAB>target-callee
+c	java	printf	System.out.printf
+java	c	System.out.printf	printf

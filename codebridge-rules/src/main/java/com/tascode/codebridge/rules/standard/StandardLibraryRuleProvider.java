@@ -8,6 +8,6 @@ import java.util.List;
 public final class StandardLibraryRuleProvider implements ConversionRuleProvider {
     @Override
     public List<ConversionRule> rules() {
-        return List.of(new StandardLibraryCallRule());
+        return List.of(new StringEqualityRule(), new CoutConversionRule(), new StandardLibraryCallRule(), new NumericConditionRule(), new IntegerInputRule());
     }
 }

@@ -4,6 +4,8 @@
  <artifactId>codebridge-integration-tests</artifactId>
  <dependencies><dependency><groupId>com.tascode</groupId><artifactId>codebridge-rules</artifactId><version>${project.version}</version></dependency>
   <dependency><groupId>com.tascode</groupId><artifactId>codebridge-core</artifactId><version>${project.version}</version></dependency>
+  <dependency><groupId>com.tascode</groupId><artifactId>codebridge-validation</artifactId><version>${project.version}</version></dependency>
+  <dependency><groupId>com.tascode</groupId><artifactId>codebridge-web</artifactId><version>${project.version}</version></dependency>
   <dependency><groupId>com.tascode</groupId><artifactId>codebridge-lang-c</artifactId><version>${project.version}</version></dependency>
   <dependency><groupId>com.tascode</groupId><artifactId>codebridge-lang-cpp</artifactId><version>${project.version}</version></dependency>
   <dependency><groupId>com.tascode</groupId><artifactId>codebridge-lang-java</artifactId><version>${project.version}</version></dependency>

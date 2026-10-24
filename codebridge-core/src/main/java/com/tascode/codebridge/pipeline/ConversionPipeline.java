@@ -1,6 +1,13 @@
 package com.tascode.codebridge.pipeline;
 
 import com.tascode.codebridge.capability.IrFeatureAnalyzer;
+import com.tascode.codebridge.analysis.SymbolAnalyzer;
+import com.tascode.codebridge.analysis.TypeAnalyzer;
+import com.tascode.codebridge.analysis.FunctionCallAnalyzer;
+import com.tascode.codebridge.analysis.ConditionTypeAnalyzer;
+import com.tascode.codebridge.analysis.ScanfAnalyzer;
+import com.tascode.codebridge.analysis.CoutAnalyzer;
+import com.tascode.codebridge.analysis.StringFeatureAnalyzer;
 import com.tascode.codebridge.diagnostic.Diagnostic;
 import com.tascode.codebridge.diagnostic.Severity;
 import com.tascode.codebridge.language.Language;
@@ -26,6 +33,13 @@ public final class ConversionPipeline {
     private final Map<Language, LanguageModule> modules;
     private final List<ConversionRule> rules;
     private final IrFeatureAnalyzer featureAnalyzer = new IrFeatureAnalyzer();
+    private final SymbolAnalyzer symbolAnalyzer = new SymbolAnalyzer();
+    private final TypeAnalyzer typeAnalyzer = new TypeAnalyzer();
+    private final FunctionCallAnalyzer functionCallAnalyzer = new FunctionCallAnalyzer();
+    private final ConditionTypeAnalyzer conditionTypeAnalyzer = new ConditionTypeAnalyzer();
+    private final ScanfAnalyzer scanfAnalyzer = new ScanfAnalyzer();
+    private final CoutAnalyzer coutAnalyzer = new CoutAnalyzer();
+    private final StringFeatureAnalyzer stringFeatureAnalyzer = new StringFeatureAnalyzer();
     private final CPreprocessor preprocessor = new CPreprocessor();
 
     public ConversionPipeline(List<LanguageModule> modules, List<ConversionRule> rules) {
@@ -52,6 +66,16 @@ public final class ConversionPipeline {
         if (root instanceof Program program && !preprocessed.includes().isEmpty()) {
             root = new Program(program.irVersion(), program.sourceSpan(), program.functions(), preprocessed.includes());
         }
+        if (root instanceof Program program) {
+            diagnostics.addAll(symbolAnalyzer.analyze(program));
+            diagnostics.addAll(typeAnalyzer.analyze(program, from, to));
+            diagnostics.addAll(functionCallAnalyzer.analyze(program, from, to));
+            diagnostics.addAll(conditionTypeAnalyzer.analyze(program, from, to));
+            diagnostics.addAll(scanfAnalyzer.analyze(program, from, to));
+            diagnostics.addAll(coutAnalyzer.analyze(program, from));
+            diagnostics.addAll(stringFeatureAnalyzer.analyze(program, to));
+        }
+        if (!diagnostics.isEmpty()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
         for (String feature : featureAnalyzer.requiredFeatures(root)) {
             if (!targetModule.capabilities().supports(feature)) {
                 diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-UNSUP-FEATURE",

@@ -5,6 +5,8 @@ import com.tascode.codebridge.diagnostic.Severity;
 import com.tascode.codebridge.diagnostic.SourceSpan;
 import com.tascode.codebridge.language.Language;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -28,6 +30,7 @@ import javax.tools.ToolProvider;
 public final class CompilerValidationService implements CompilationValidator {
     private static final int MAX_SOURCE_CHARS = 1_000_000;
     private static final int MAX_COMPILER_OUTPUT_CHARS = 4_000;
+    private static final int MAX_JAVA_DIAGNOSTICS = 100;
     private final String cCompiler;
     private final String cppCompiler;
     private final Duration timeout;
@@ -74,7 +77,10 @@ public final class CompilerValidationService implements CompilationValidator {
                 boolean success = Boolean.TRUE.equals(compiler.getTask(null, fileManager, collector,
                         List.of("--release", "21", "-proc:none", "-d", output.toString()), null, List.of(unit)).call());
                 List<Diagnostic> diagnostics = new ArrayList<>();
-                for (var item : collector.getDiagnostics()) {
+                var compilerDiagnostics = collector.getDiagnostics();
+                int emitted = 0;
+                for (var item : compilerDiagnostics) {
+                    if (emitted++ >= MAX_JAVA_DIAGNOSTICS) break;
                     Severity severity = item.getKind() == javax.tools.Diagnostic.Kind.ERROR ? Severity.ERROR
                             : item.getKind() == javax.tools.Diagnostic.Kind.WARNING || item.getKind() == javax.tools.Diagnostic.Kind.MANDATORY_WARNING
                                     ? Severity.WARNING : Severity.INFO;
@@ -87,6 +93,10 @@ public final class CompilerValidationService implements CompilationValidator {
                     } else {
                         diagnostics.add(Diagnostic.withoutLocation(severity, "CB-VALIDATE-JAVA-DIAGNOSTIC", message));
                     }
+                }
+                if (collector.getDiagnostics().size() > MAX_JAVA_DIAGNOSTICS) {
+                    diagnostics.add(Diagnostic.withoutLocation(Severity.WARNING, "CB-VALIDATE-DIAGNOSTICS-TRUNCATED",
+                            "Additional Java compiler diagnostics were omitted."));
                 }
                 if (!success && diagnostics.isEmpty()) {
                     diagnostics.add(Diagnostic.withoutLocation(Severity.ERROR, "CB-VALIDATE-JAVA-FAILED",
@@ -112,13 +122,8 @@ public final class CompilerValidationService implements CompilationValidator {
                     "The " + language.id() + " compiler ('" + compiler + "') could not be started.");
         }
 
-        CompletableFuture<String> output = CompletableFuture.supplyAsync(() -> {
-            try {
-                return new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            } catch (IOException exception) {
-                return "Compiler output could not be read: " + safeMessage(exception);
-            }
-        });
+        CompletableFuture<String> output = CompletableFuture.supplyAsync(
+                () -> readCompilerOutput(process.getInputStream()));
         try (var input = process.getOutputStream()) {
             input.write(source.getBytes(StandardCharsets.UTF_8));
         } catch (IOException exception) {
@@ -130,6 +135,8 @@ public final class CompilerValidationService implements CompilationValidator {
         try {
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                 process.destroyForcibly();
+                process.waitFor(1, TimeUnit.SECONDS);
+                output.cancel(true);
                 return result(language, ValidationStatus.TIMED_OUT, "CB-VALIDATE-TIMEOUT",
                         "Compilation exceeded the configured time limit.");
             }
@@ -149,6 +156,21 @@ public final class CompilerValidationService implements CompilationValidator {
         }
     }
 
+    private static String readCompilerOutput(InputStream input) {
+        int byteLimit = MAX_COMPILER_OUTPUT_CHARS * 4;
+        try (input; var kept = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                int remaining = byteLimit - kept.size();
+                if (remaining > 0) kept.write(buffer, 0, Math.min(read, remaining));
+            }
+            String output = new String(kept.toByteArray(), StandardCharsets.UTF_8);
+            return trimOutput(output);
+        } catch (IOException exception) {
+            return "Compiler output could not be read: " + safeMessage(exception);
+        }
+    }
     private static CompilationResult result(Language language, ValidationStatus status, String code, String message) {
         return new CompilationResult(language, status,
                 List.of(Diagnostic.withoutLocation(Severity.ERROR, code, message)));

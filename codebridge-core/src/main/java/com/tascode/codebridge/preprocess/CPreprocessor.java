@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
 
 /** Handles the deliberately limited C/C++ preprocessor subset before grammar parsing. */
 public final class CPreprocessor {
-    private static final Set<String> SUPPORTED_HEADERS = Set.of("stdio.h", "stdbool.h", "stdlib.h", "string.h", "math.h");
+    private static final Set<String> SUPPORTED_HEADERS = Set.of("stdio.h", "stdbool.h", "stdlib.h", "string.h", "math.h", "iostream", "string");
     private static final Pattern INCLUDE = Pattern.compile("#\\s*include\\s*<([A-Za-z0-9_.]+)>\\s*");
     private static final Pattern DEFINE = Pattern.compile("#\\s*define\\s+([A-Za-z_][A-Za-z_0-9]*)(?:\\s+(.*))?\\s*");
     private static final Pattern OBJECT_MACRO_VALUE = Pattern.compile("(?:[+-]?\\d+|true|false|\"[^\"\\n]*\")");

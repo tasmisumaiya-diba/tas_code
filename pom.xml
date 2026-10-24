@@ -18,6 +18,7 @@
         <module>codebridge-lang-java</module>
         <module>codebridge-validation</module>
         <module>codebridge-rules</module>
+        <module>codebridge-web</module>
         <module>codebridge-integration-tests</module>
     </modules>
 

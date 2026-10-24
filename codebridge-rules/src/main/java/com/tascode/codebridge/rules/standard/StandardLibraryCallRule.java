@@ -43,6 +43,10 @@ public final class StandardLibraryCallRule implements ConversionRule {
             List<Statement> children = block.statements().stream().map(child -> rewriteStatement(child, context)).toList();
             return new BlockStatement(block.irVersion(), block.sourceSpan(), children);
         }
+        if (statement instanceof ArrayDeclaration array) {
+            return new ArrayDeclaration(array.irVersion(), array.sourceSpan(), array.elementType(), array.name(),
+                    rewriteExpression(array.size(), context));
+        }
         if (statement instanceof VariableDeclaration variable) {
             return new VariableDeclaration(variable.irVersion(), variable.sourceSpan(), variable.name(), variable.type(),
                     variable.initializer().map(value -> rewriteExpression(value, context)));
@@ -55,6 +59,27 @@ public final class StandardLibraryCallRule implements ConversionRule {
             Expression rewritten = rewriteExpression(expression.expression(), context);
             return new ExpressionStatement(expression.irVersion(), expression.sourceSpan(), rewritten);
         }
+        if (statement instanceof ForStatement loop) {
+            return new ForStatement(loop.irVersion(), loop.sourceSpan(),
+                    loop.initializer().map(initializer -> rewriteStatement(initializer, context)),
+                    loop.condition().map(condition -> rewriteExpression(condition, context)),
+                    loop.update().map(update -> rewriteExpression(update, context)),
+                    rewriteStatement(loop.body(), context));
+        }
+        if (statement instanceof IfStatement conditional) {
+            return new IfStatement(conditional.irVersion(), conditional.sourceSpan(),
+                    rewriteExpression(conditional.condition(), context),
+                    rewriteStatement(conditional.thenBranch(), context),
+                    conditional.elseBranch().map(branch -> rewriteStatement(branch, context)));
+        }
+        if (statement instanceof DoWhileStatement loop) {
+            return new DoWhileStatement(loop.irVersion(), loop.sourceSpan(), rewriteStatement(loop.body(), context),
+                    rewriteExpression(loop.condition(), context));
+        }
+        if (statement instanceof WhileStatement loop) {
+            return new WhileStatement(loop.irVersion(), loop.sourceSpan(), rewriteExpression(loop.condition(), context),
+                    rewriteStatement(loop.body(), context));
+        }
         return statement;
     }
 
@@ -63,8 +88,31 @@ public final class StandardLibraryCallRule implements ConversionRule {
             return new BinaryExpression(binary.irVersion(), binary.sourceSpan(), binary.operator(),
                     rewriteExpression(binary.left(), context), rewriteExpression(binary.right(), context));
         }
+        if (expression instanceof ArrayAccessExpression access) {
+            return new ArrayAccessExpression(access.irVersion(), access.sourceSpan(),
+                    rewriteExpression(access.array(), context), rewriteExpression(access.index(), context));
+        }
+        if (expression instanceof AssignmentExpression assignment) {
+            return new AssignmentExpression(assignment.irVersion(), assignment.sourceSpan(), rewriteExpression(assignment.target(), context),
+                    rewriteExpression(assignment.value(), context));
+        }
+        if (expression instanceof UpdateExpression update) return update;
+        if (expression instanceof UnaryExpression unary) {
+            return new UnaryExpression(unary.irVersion(), unary.sourceSpan(), unary.operator(),
+                    rewriteExpression(unary.operand(), context));
+        }
         if (expression instanceof CallExpression call) {
-            List<Expression> arguments = call.arguments().stream().map(argument -> rewriteExpression(argument, context)).toList();
+            List<Expression> arguments = new ArrayList<>();
+            for (int i = 0; i < call.arguments().size(); i++) {
+                Expression argument = rewriteExpression(call.arguments().get(i), context);
+                if (i == 0 && context.from() != Language.JAVA && context.to() == Language.JAVA
+                        && call.callee().equals("printf") && argument instanceof LiteralExpression literal
+                        && literal.value() instanceof String format) {
+                    String javaFormat = format.replaceAll("(?<!%)%l([feg])", "%$1");
+                    argument = new LiteralExpression(literal.irVersion(), literal.sourceSpan(), javaFormat);
+                }
+                arguments.add(argument);
+            }
             String callee = mappings.getOrDefault(new MappingKey(context.from(), context.to(), call.callee()), call.callee());
             return new CallExpression(call.irVersion(), call.sourceSpan(), callee, arguments);
         }

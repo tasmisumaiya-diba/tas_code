@@ -16,18 +16,30 @@ public final class JavaGenerator implements LanguageGenerator {
             return new GenerationResult(null, List.of(Diagnostic.withoutLocation(Severity.ERROR, "CB-GEN-JAVA-ROOT", "Java generation requires a program node.")));
         }
         StringBuilder out = new StringBuilder("public class TasCodeGenerated {\n");
+        for (GlobalVariableDeclaration global : program.globals()) {
+            out.append("    ").append(global.visibility().isBlank() ? "" : global.visibility() + " ").append("static ");
+            if (global.readOnly()) out.append("final ");
+            out.append(javaType(global.type())).append(" ").append(global.name());
+            global.initializer().ifPresent(value -> { out.append(" = "); expression(out, value); });
+            out.append(";\n");
+        }
+        if (!program.globals().isEmpty()) out.append("\n");
         if (containsIntegerInput(program)) out.append("    private static final java.util.Scanner CODEBRIDGE_INPUT = new java.util.Scanner(System.in).useLocale(java.util.Locale.ROOT);\n");
         if (containsCharInput(program)) out.append("    private static char codeBridgeReadCharOr(char previous) { String next = CODEBRIDGE_INPUT.findWithinHorizon(\"(?s).\", 0); return next == null ? previous : next.charAt(0); }\n");
         try {
             for (FunctionDeclaration function : program.functions()) {
-                out.append("    public static ").append(javaType(function.returnType())).append(' ').append(function.name()).append('(');
-                for (int i = 0; i < function.parameters().size(); i++) {
-                    if (i > 0) out.append(", ");
-                    Parameter parameter = function.parameters().get(i);
-                    out.append(javaType(parameter.type())).append(' ').append(parameter.name());
+                boolean javaEntryPoint = isJavaEntryPoint(function);
+                if (javaEntryPoint) out.append("    public static void main(String[] args) ");
+                else {
+                    out.append("    public static ").append(javaType(function.returnType())).append(' ').append(function.name()).append('(');
+                    for (int i = 0; i < function.parameters().size(); i++) {
+                        if (i > 0) out.append(", ");
+                        Parameter parameter = function.parameters().get(i);
+                        out.append(javaType(parameter.type())).append(' ').append(parameter.name());
+                    }
+                    out.append(") ");
                 }
-                out.append(") ");
-                block(out, function.body(), 1);
+                block(out, function.body(), 1, javaEntryPoint);
                 out.append('\n');
             }
             out.append("}\n");
@@ -38,21 +50,36 @@ public final class JavaGenerator implements LanguageGenerator {
     }
 
     private String javaType(String type) {
-        return switch (type) { case "bool", "_Bool" -> "boolean"; case "string", "String" -> "String"; default -> type; };
+        if (type.endsWith("[]")) return javaType(type.substring(0, type.length() - 2)) + "[]";
+        return switch (type) { case "bool", "_Bool" -> "boolean"; case "c-long" -> "long"; case "string", "String" -> "String"; default -> type; };
     }
 
-    private void block(StringBuilder out, BlockStatement block, int depth) {
+    private boolean isJavaEntryPoint(FunctionDeclaration function) {
+        return function.name().equals("main") && function.returnType().equals("int") && function.parameters().isEmpty();
+    }
+
+    private void block(StringBuilder out, BlockStatement block, int depth, boolean javaEntryPoint) {
         out.append("{\n");
-        for (Statement statement : block.statements()) {
+        List<Statement> statements = block.statements();
+        for (int i = 0; i < statements.size(); i++) {
+            Statement current = statements.get(i);
+            if (javaEntryPoint && i == statements.size() - 1 && isZeroReturn(current)) continue;
             out.append("    ".repeat(depth + 1));
-            statement(out, statement, depth + 1);
+            statement(out, current, depth + 1, javaEntryPoint);
             out.append('\n');
         }
         out.append("    ".repeat(depth)).append('}');
     }
 
-    private void statement(StringBuilder out, Statement statement, int depth) {
-        if (statement instanceof BlockStatement block) block(out, block, depth);
+    private boolean isZeroReturn(Statement statement) {
+        if (!(statement instanceof ReturnStatement returned) || returned.value().isEmpty()) return false;
+        Expression value = returned.value().orElseThrow();
+        return value instanceof LiteralExpression literal
+                && literal.value() instanceof Number number && number.doubleValue() == 0.0d;
+    }
+
+    private void statement(StringBuilder out, Statement statement, int depth, boolean javaEntryPoint) {
+        if (statement instanceof BlockStatement block) block(out, block, depth, javaEntryPoint);
         else if (statement instanceof ArrayDeclaration array) {
             out.append(javaType(array.elementType())).append("[] ").append(array.name()).append(" = new ")
                     .append(javaType(array.elementType())).append('[');
@@ -76,7 +103,12 @@ public final class JavaGenerator implements LanguageGenerator {
         } else if (statement instanceof ExpressionStatement expressionStatement) {
             statementExpression(out, expressionStatement.expression()); out.append(';');
         } else if (statement instanceof ReturnStatement returned) {
-            out.append("return"); returned.value().ifPresent(value -> { out.append(' '); expression(out, value); }); out.append(';');
+            if (javaEntryPoint) {
+                if (returned.value().isEmpty() || isZeroReturn(statement)) out.append("return;");
+                else { out.append("System.exit("); expression(out, returned.value().orElseThrow()); out.append("); return;"); }
+            } else {
+                out.append("return"); returned.value().ifPresent(value -> { out.append(' '); expression(out, value); }); out.append(';');
+            }
         } else if (statement instanceof BreakStatement) {
             out.append("break;");
         } else if (statement instanceof ContinueStatement) {
@@ -93,17 +125,17 @@ public final class JavaGenerator implements LanguageGenerator {
             });
             out.append("; "); loop.condition().ifPresent(value -> expression(out, value));
             out.append("; "); loop.update().ifPresent(value -> statementExpression(out, value));
-            out.append(") "); statement(out, loop.body(), depth);
+            out.append(") "); statement(out, loop.body(), depth, javaEntryPoint);
         } else if (statement instanceof IfStatement conditional) {
             out.append("if ("); expression(out, conditional.condition()); out.append(") ");
-            statement(out, conditional.thenBranch(), depth);
-            conditional.elseBranch().ifPresent(branch -> { out.append(" else "); statement(out, branch, depth); });
+            statement(out, conditional.thenBranch(), depth, javaEntryPoint);
+            conditional.elseBranch().ifPresent(branch -> { out.append(" else "); statement(out, branch, depth, javaEntryPoint); });
         } else if (statement instanceof DoWhileStatement loop) {
-            out.append("do "); statement(out, loop.body(), depth);
+            out.append("do "); statement(out, loop.body(), depth, javaEntryPoint);
             out.append(" while ("); expression(out, loop.condition()); out.append(");");
         } else if (statement instanceof WhileStatement loop) {
             out.append("while ("); expression(out, loop.condition()); out.append(") ");
-            statement(out, loop.body(), depth);
+            statement(out, loop.body(), depth, javaEntryPoint);
         } else throw new UnsupportedOperationException("Unsupported Java statement node: " + statement.getClass().getSimpleName());
     }
 
@@ -182,7 +214,7 @@ public final class JavaGenerator implements LanguageGenerator {
             if (literal.value() instanceof String value) out.append(quoteString(value));
             else if (literal.value() instanceof Boolean value) out.append(value);
             else if (literal.value() instanceof Character value) out.append(characterLiteral(value));
-            else out.append(literal.value());
+            else { out.append(literal.value()); if (literal.value() instanceof Long) out.append("L"); if (literal.value() instanceof Float) out.append("f"); }
         } else if (expression instanceof NameExpression name) out.append(name.name());
         else if (expression instanceof BinaryExpression binary) {
             out.append('('); expression(out, binary.left()); out.append(' ').append(binary.operator()).append(' '); expression(out, binary.right()); out.append(')');
@@ -201,9 +233,13 @@ public final class JavaGenerator implements LanguageGenerator {
             out.append('(').append(unary.operator()); expression(out, unary.operand()); out.append(')');
         } else if (expression instanceof CallExpression call) {
             if (call.callee().startsWith("__codebridge_read_")) {
-                if (call.callee().equals("__codebridge_read_char")) {
+                if (call.callee().equals("__codebridge_read_token_char")) {
+                    out.append("(CODEBRIDGE_INPUT.hasNext() ? CODEBRIDGE_INPUT.next().charAt(0) : ");
+                    expression(out, call.arguments().getFirst()); out.append(')'); return;
+                }                if (call.callee().equals("__codebridge_read_char")) {
                     out.append("codeBridgeReadCharOr("); expression(out, call.arguments().getFirst()); out.append(')'); return;
                 }
+                if (call.callee().equals("__codebridge_read_string")) { out.append("(CODEBRIDGE_INPUT.hasNext() ? CODEBRIDGE_INPUT.next() : \"\")"); return; }
                 String suffix = switch (call.callee()) { case "__codebridge_read_float" -> "Float"; case "__codebridge_read_double" -> "Double"; default -> "Int"; };
                 out.append("(CODEBRIDGE_INPUT.hasNext").append(suffix).append("() ? CODEBRIDGE_INPUT.next").append(suffix).append("() : ");
                 expression(out, call.arguments().getFirst()); out.append(')'); return;

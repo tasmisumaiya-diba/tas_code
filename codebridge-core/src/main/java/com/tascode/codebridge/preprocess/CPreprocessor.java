@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
 
 /** Handles the deliberately limited C/C++ preprocessor subset before grammar parsing. */
 public final class CPreprocessor {
-    private static final Set<String> SUPPORTED_HEADERS = Set.of("stdio.h", "stdbool.h", "stdlib.h", "string.h", "math.h", "iostream", "string");
+    private static final Set<String> SUPPORTED_HEADERS = Set.of("stdio.h", "stdbool.h", "stdlib.h", "string.h", "math.h", "iostream", "string", "vector", "cstdint");
     private static final Pattern INCLUDE = Pattern.compile("#\\s*include\\s*<([A-Za-z0-9_.]+)>\\s*");
     private static final Pattern DEFINE = Pattern.compile("#\\s*define\\s+([A-Za-z_][A-Za-z_0-9]*)(?:\\s+(.*))?\\s*");
     private static final Pattern OBJECT_MACRO_VALUE = Pattern.compile("(?:[+-]?\\d+|true|false|\"[^\"\\n]*\")");
@@ -33,14 +33,17 @@ public final class CPreprocessor {
             String content = stripLineEnding(line);
             int directive = directiveIndex(content, blockComment[0]);
             if (directive < 0) { output.append(expand(line, macros, diagnostics, i + 1, blockComment)); continue; }
-            String trimmed = content.substring(directive);
+            String trimmed = stripTrailingComments(content.substring(directive));
             int column = directive + 1;
             updateBlockComment(content, blockComment);
             int lineNumber = i + 1;
             Matcher include = INCLUDE.matcher(trimmed);
             if (include.matches()) {
                 String header = include.group(1);
-                if (SUPPORTED_HEADERS.contains(header)) includes.add(header);
+                if (language == Language.C && Set.of("iostream", "string", "vector", "cstdint").contains(header)) {
+                    diagnostics.add(Diagnostic.at(com.tascode.codebridge.diagnostic.Severity.ERROR, "CB-PREPROC-HEADER-LANGUAGE",
+                            "Header '" + header + "' is only supported for C++ source.", SourceSpan.point(lineNumber, column)));
+                } else if (SUPPORTED_HEADERS.contains(header)) includes.add(header);
                 else diagnostics.add(Diagnostic.at(com.tascode.codebridge.diagnostic.Severity.ERROR, "CB-PREPROC-UNSUPPORTED-INCLUDE", "Header '" + header + "' is not supported by the preprocessor.", SourceSpan.point(lineNumber, column)));
                 output.append(blank(line));
                 continue;
@@ -114,6 +117,32 @@ public final class CPreprocessor {
         }
     }
 
+    private String stripTrailingComments(String directive) {
+        char quote = 0;
+        boolean escaped = false;
+        for (int i = 0; i < directive.length(); i++) {
+            char c = directive.charAt(i), next = i + 1 < directive.length() ? directive.charAt(i + 1) : 0;
+            if (quote != 0) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c == '/' && next == '/') return directive.substring(0, i).stripTrailing();
+            if (c == '/' && next == '*') {
+                int end = directive.indexOf("*/", i + 2);
+                if (end < 0) return directive.substring(0, i).stripTrailing();
+                String suffix = directive.substring(end + 2);
+                if (suffix.isBlank() || suffix.startsWith("/*") || suffix.startsWith("//")) {
+                    String remaining = stripTrailingComments(suffix);
+                    if (remaining.isBlank()) return directive.substring(0, i).stripTrailing();
+                }
+                return directive;
+            }
+        }
+        return directive;
+    }
     private String stripLineEnding(String line) { return line.endsWith("\n") ? line.substring(0, line.length() - 1).replaceFirst("\\r$", "") : line; }
     private String blank(String line) { return line.replaceAll("[^\\r\\n]", " "); }
 }

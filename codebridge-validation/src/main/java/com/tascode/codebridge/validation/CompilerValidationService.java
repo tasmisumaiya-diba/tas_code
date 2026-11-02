@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.tools.DiagnosticCollector;
 import javax.tools.JavaCompiler;
 import javax.tools.SimpleJavaFileObject;
@@ -31,6 +33,7 @@ public final class CompilerValidationService implements CompilationValidator {
     private static final int MAX_SOURCE_CHARS = 1_000_000;
     private static final int MAX_COMPILER_OUTPUT_CHARS = 4_000;
     private static final int MAX_JAVA_DIAGNOSTICS = 100;
+    private static final Pattern NATIVE_LOCATION = Pattern.compile("(?m)^<stdin>:(\\d+):(\\d+):");
     private final String cCompiler;
     private final String cppCompiler;
     private final Duration timeout;
@@ -75,7 +78,7 @@ public final class CompilerValidationService implements CompilationValidator {
             var fileManager = compiler.getStandardFileManager(collector, null, StandardCharsets.UTF_8);
             try (fileManager) {
                 boolean success = Boolean.TRUE.equals(compiler.getTask(null, fileManager, collector,
-                        List.of("--release", "21", "-proc:none", "-d", output.toString()), null, List.of(unit)).call());
+                        List.of("--release", "21", "-proc:none", "-Xmaxerrs", Integer.toString(MAX_JAVA_DIAGNOSTICS), "-Xmaxwarns", Integer.toString(MAX_JAVA_DIAGNOSTICS), "-d", output.toString()), null, List.of(unit)).call());
                 List<Diagnostic> diagnostics = new ArrayList<>();
                 var compilerDiagnostics = collector.getDiagnostics();
                 int emitted = 0;
@@ -142,8 +145,8 @@ public final class CompilerValidationService implements CompilationValidator {
             }
             String compilerOutput = trimOutput(output.get(2, TimeUnit.SECONDS));
             if (process.exitValue() == 0) return new CompilationResult(language, ValidationStatus.VALID, List.of());
-            return result(language, ValidationStatus.INVALID, "CB-VALIDATE-COMPILER-DIAGNOSTIC",
-                    compilerOutput.isBlank() ? "The compiler rejected the generated source." : compilerOutput);
+            String message = compilerOutput.isBlank() ? "The compiler rejected the generated source." : compilerOutput;
+            return new CompilationResult(language, ValidationStatus.INVALID, List.of(nativeDiagnostic(message)));
         } catch (InterruptedException exception) {
             process.destroyForcibly();
             Thread.currentThread().interrupt();
@@ -170,6 +173,16 @@ public final class CompilerValidationService implements CompilationValidator {
         } catch (IOException exception) {
             return "Compiler output could not be read: " + safeMessage(exception);
         }
+    }
+    static Diagnostic nativeDiagnostic(String message) {
+        Matcher matcher = NATIVE_LOCATION.matcher(message);
+        if (matcher.find()) {
+            int line = Integer.parseInt(matcher.group(1));
+            int column = Integer.parseInt(matcher.group(2));
+            return Diagnostic.at(Severity.ERROR, "CB-VALIDATE-COMPILER-DIAGNOSTIC", message,
+                    new SourceSpan(line, column, line, column));
+        }
+        return Diagnostic.withoutLocation(Severity.ERROR, "CB-VALIDATE-COMPILER-DIAGNOSTIC", message);
     }
     private static CompilationResult result(Language language, ValidationStatus status, String code, String message) {
         return new CompilationResult(language, status,

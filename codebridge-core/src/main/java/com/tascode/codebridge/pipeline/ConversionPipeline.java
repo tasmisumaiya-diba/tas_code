@@ -5,9 +5,11 @@ import com.tascode.codebridge.analysis.SymbolAnalyzer;
 import com.tascode.codebridge.analysis.TypeAnalyzer;
 import com.tascode.codebridge.analysis.FunctionCallAnalyzer;
 import com.tascode.codebridge.analysis.ConditionTypeAnalyzer;
+import com.tascode.codebridge.analysis.CppIdentifierAnalyzer;
 import com.tascode.codebridge.analysis.ScanfAnalyzer;
 import com.tascode.codebridge.analysis.CoutAnalyzer;
 import com.tascode.codebridge.analysis.StringFeatureAnalyzer;
+import com.tascode.codebridge.analysis.IoCallUsageAnalyzer;
 import com.tascode.codebridge.diagnostic.Diagnostic;
 import com.tascode.codebridge.diagnostic.Severity;
 import com.tascode.codebridge.language.Language;
@@ -35,11 +37,13 @@ public final class ConversionPipeline {
     private final IrFeatureAnalyzer featureAnalyzer = new IrFeatureAnalyzer();
     private final SymbolAnalyzer symbolAnalyzer = new SymbolAnalyzer();
     private final TypeAnalyzer typeAnalyzer = new TypeAnalyzer();
+    private final CppIdentifierAnalyzer cppIdentifierAnalyzer = new CppIdentifierAnalyzer();
     private final FunctionCallAnalyzer functionCallAnalyzer = new FunctionCallAnalyzer();
     private final ConditionTypeAnalyzer conditionTypeAnalyzer = new ConditionTypeAnalyzer();
     private final ScanfAnalyzer scanfAnalyzer = new ScanfAnalyzer();
     private final CoutAnalyzer coutAnalyzer = new CoutAnalyzer();
     private final StringFeatureAnalyzer stringFeatureAnalyzer = new StringFeatureAnalyzer();
+    private final IoCallUsageAnalyzer ioCallUsageAnalyzer = new IoCallUsageAnalyzer();
     private final CPreprocessor preprocessor = new CPreprocessor();
 
     public ConversionPipeline(List<LanguageModule> modules, List<ConversionRule> rules) {
@@ -49,6 +53,16 @@ public final class ConversionPipeline {
     }
 
     public ConversionResult convert(Language from, Language to, String source) {
+        Objects.requireNonNull(from); Objects.requireNonNull(to); Objects.requireNonNull(source);
+        try {
+            return convertInternal(from, to, source);
+        } catch (StackOverflowError excessiveNesting) {
+            return new ConversionResult(from, to, Optional.empty(), List.of(Diagnostic.withoutLocation(Severity.ERROR,
+                    "CB-PARSE-NESTING-LIMIT", "Source nesting exceeds the supported analysis depth.")));
+        }
+    }
+
+    private ConversionResult convertInternal(Language from, Language to, String source) {
         Objects.requireNonNull(from); Objects.requireNonNull(to); Objects.requireNonNull(source);
         List<Diagnostic> diagnostics = new ArrayList<>();
         LanguageModule sourceModule = modules.get(from), targetModule = modules.get(to);
@@ -64,17 +78,51 @@ public final class ConversionPipeline {
         if (!parsed.successful()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
         IrNode root = parsed.root();
         if (root instanceof Program program && !preprocessed.includes().isEmpty()) {
-            root = new Program(program.irVersion(), program.sourceSpan(), program.functions(), preprocessed.includes());
+            root = new Program(program.irVersion(), program.sourceSpan(), program.functions(), preprocessed.includes(), program.globals(), program.enums(), program.classes());
+        }
+        return convertIrInternal(from, to, root, diagnostics, parsed.semanticDiagnostics());
+    }
+
+    /** Runs the shared semantic checks, rules, and generator for IR supplied by a compiler frontend. */
+    public ConversionResult convertIr(Language from, Language to, IrNode root) {
+        Objects.requireNonNull(from); Objects.requireNonNull(to); Objects.requireNonNull(root);
+        try {
+            return convertIrInternal(from, to, root, new ArrayList<>(), List.of());
+        } catch (StackOverflowError excessiveNesting) {
+            return new ConversionResult(from, to, Optional.empty(), List.of(Diagnostic.withoutLocation(Severity.ERROR,
+                    "CB-IR-NESTING-LIMIT", "Intermediate representation nesting exceeds the supported analysis depth.")));
+        }
+    }
+
+    private ConversionResult convertIrInternal(Language from, Language to, IrNode root,
+                                               List<Diagnostic> diagnostics,
+                                               List<Diagnostic> semanticDiagnostics) {
+        LanguageModule targetModule = modules.get(to);
+        if (targetModule == null || modules.get(from) == null) {
+            diagnostics.add(Diagnostic.withoutLocation(Severity.ERROR, "CB-LANG-NOT-REGISTERED", "A parser or generator for the selected language is not registered."));
+            return new ConversionResult(from, to, Optional.empty(), diagnostics);
         }
         if (root instanceof Program program) {
             diagnostics.addAll(symbolAnalyzer.analyze(program));
+            diagnostics.addAll(cppIdentifierAnalyzer.analyze(program, from, to));
             diagnostics.addAll(typeAnalyzer.analyze(program, from, to));
             diagnostics.addAll(functionCallAnalyzer.analyze(program, from, to));
             diagnostics.addAll(conditionTypeAnalyzer.analyze(program, from, to));
             diagnostics.addAll(scanfAnalyzer.analyze(program, from, to));
             diagnostics.addAll(coutAnalyzer.analyze(program, from));
             diagnostics.addAll(stringFeatureAnalyzer.analyze(program, to));
+            diagnostics.addAll(ioCallUsageAnalyzer.analyze(program, from, to));
+            if (from == Language.C && to == Language.JAVA && !program.enums().isEmpty()) {
+                program.enums().forEach(enumeration -> diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-C-ENUM-TARGET-UNSUPPORTED",
+                        "C enums cannot be represented as Java enum types in the current subset.", enumeration.sourceSpan())));
+            }
+            if (from == Language.JAVA && to == Language.C && !program.classes().isEmpty()) {
+                program.classes().forEach(type -> diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-JAVA-CLASS-STATE-UNSUPPORTED",
+                        "Java instance fields require class and object representation, which the C target does not support.", type.sourceSpan())));
+            }
         }
+        if (!diagnostics.isEmpty()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
+        diagnostics.addAll(semanticDiagnostics);
         if (!diagnostics.isEmpty()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
         for (String feature : featureAnalyzer.requiredFeatures(root)) {
             if (!targetModule.capabilities().supports(feature)) {

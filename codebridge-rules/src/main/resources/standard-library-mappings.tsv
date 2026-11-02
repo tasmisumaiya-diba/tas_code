@@ -7,3 +7,5 @@ cpp	java	printf	System.out.printf
 java	cpp	System.out.printf	printf
 cpp	java	puts	System.out.println
 java	cpp	System.out.println	puts
+java	c	System.out.print	printf
+java	cpp	System.out.print	__codebridge_cout

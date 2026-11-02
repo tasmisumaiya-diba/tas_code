@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Rewrites known function callees from a classpath TSV mapping table. */
 public final class StandardLibraryCallRule implements ConversionRule {
@@ -32,93 +33,188 @@ public final class StandardLibraryCallRule implements ConversionRule {
     @Override
     public IrNode rewrite(IrNode node, RuleContext context) {
         if (!(node instanceof Program program)) return node;
-        List<FunctionDeclaration> functions = program.functions().stream().map(function -> new FunctionDeclaration(
-                function.irVersion(), function.sourceSpan(), function.returnType(), function.name(), function.parameters(),
-                (BlockStatement) rewriteStatement(function.body(), context))).toList();
-        return new Program(program.irVersion(), program.sourceSpan(), functions, program.includes());
+        List<FunctionDeclaration> functions = program.functions().stream().map(function -> {
+            Map<String, String> locals = new HashMap<>();
+            function.parameters().forEach(parameter -> locals.put(parameter.name(), parameter.type()));
+            return new FunctionDeclaration(function.irVersion(), function.sourceSpan(), function.returnType(), function.name(),
+                    function.parameters(), (BlockStatement) rewriteStatement(function.body(), context, locals));
+        }).toList();
+        return new Program(program.irVersion(), program.sourceSpan(), functions, program.includes(), program.globals(), program.enums(), program.classes());
     }
 
-    private Statement rewriteStatement(Statement statement, RuleContext context) {
+    private Statement rewriteStatement(Statement statement, RuleContext context, Map<String, String> locals) {
         if (statement instanceof BlockStatement block) {
-            List<Statement> children = block.statements().stream().map(child -> rewriteStatement(child, context)).toList();
+            Map<String, String> scope = new HashMap<>(locals);
+            List<Statement> children = new ArrayList<>();
+            for (Statement child : block.statements()) children.add(rewriteStatement(child, context, scope));
             return new BlockStatement(block.irVersion(), block.sourceSpan(), children);
         }
         if (statement instanceof ArrayDeclaration array) {
+            locals.put(array.name(), "array:" + array.elementType());
             return new ArrayDeclaration(array.irVersion(), array.sourceSpan(), array.elementType(), array.name(),
-                    rewriteExpression(array.size(), context));
+                    rewriteExpression(array.size(), context, locals));
         }
         if (statement instanceof VariableDeclaration variable) {
+            Expression initializer = variable.initializer().map(value -> rewriteExpression(value, context, locals)).orElse(null);
+            locals.put(variable.name(), variable.type());
             return new VariableDeclaration(variable.irVersion(), variable.sourceSpan(), variable.name(), variable.type(),
-                    variable.initializer().map(value -> rewriteExpression(value, context)));
+                    java.util.Optional.ofNullable(initializer));
         }
         if (statement instanceof ReturnStatement returned) {
             return new ReturnStatement(returned.irVersion(), returned.sourceSpan(),
-                    returned.value().map(value -> rewriteExpression(value, context)));
+                    returned.value().map(value -> rewriteExpression(value, context, locals)));
         }
         if (statement instanceof ExpressionStatement expression) {
-            Expression rewritten = rewriteExpression(expression.expression(), context);
-            return new ExpressionStatement(expression.irVersion(), expression.sourceSpan(), rewritten);
+            return new ExpressionStatement(expression.irVersion(), expression.sourceSpan(), rewriteExpression(expression.expression(), context, locals));
         }
         if (statement instanceof ForStatement loop) {
+            Map<String, String> loopLocals = new HashMap<>(locals);
             return new ForStatement(loop.irVersion(), loop.sourceSpan(),
-                    loop.initializer().map(initializer -> rewriteStatement(initializer, context)),
-                    loop.condition().map(condition -> rewriteExpression(condition, context)),
-                    loop.update().map(update -> rewriteExpression(update, context)),
-                    rewriteStatement(loop.body(), context));
+                    loop.initializer().map(initializer -> rewriteStatement(initializer, context, loopLocals)),
+                    loop.condition().map(condition -> rewriteExpression(condition, context, loopLocals)),
+                    loop.update().map(update -> rewriteExpression(update, context, loopLocals)),
+                    rewriteStatement(loop.body(), context, loopLocals));
         }
         if (statement instanceof IfStatement conditional) {
             return new IfStatement(conditional.irVersion(), conditional.sourceSpan(),
-                    rewriteExpression(conditional.condition(), context),
-                    rewriteStatement(conditional.thenBranch(), context),
-                    conditional.elseBranch().map(branch -> rewriteStatement(branch, context)));
+                    rewriteExpression(conditional.condition(), context, locals),
+                    rewriteStatement(conditional.thenBranch(), context, new HashMap<>(locals)),
+                    conditional.elseBranch().map(branch -> rewriteStatement(branch, context, new HashMap<>(locals))));
         }
         if (statement instanceof DoWhileStatement loop) {
-            return new DoWhileStatement(loop.irVersion(), loop.sourceSpan(), rewriteStatement(loop.body(), context),
-                    rewriteExpression(loop.condition(), context));
+            return new DoWhileStatement(loop.irVersion(), loop.sourceSpan(), rewriteStatement(loop.body(), context, new HashMap<>(locals)),
+                    rewriteExpression(loop.condition(), context, locals));
         }
         if (statement instanceof WhileStatement loop) {
-            return new WhileStatement(loop.irVersion(), loop.sourceSpan(), rewriteExpression(loop.condition(), context),
-                    rewriteStatement(loop.body(), context));
+            return new WhileStatement(loop.irVersion(), loop.sourceSpan(), rewriteExpression(loop.condition(), context, locals),
+                    rewriteStatement(loop.body(), context, new HashMap<>(locals)));
         }
         return statement;
     }
 
-    private Expression rewriteExpression(Expression expression, RuleContext context) {
+    private Expression rewriteExpression(Expression expression, RuleContext context, Map<String, String> locals) {
         if (expression instanceof BinaryExpression binary) {
-            return new BinaryExpression(binary.irVersion(), binary.sourceSpan(), binary.operator(),
-                    rewriteExpression(binary.left(), context), rewriteExpression(binary.right(), context));
+            Expression left = rewriteExpression(binary.left(), context, locals);
+            Expression right = rewriteExpression(binary.right(), context, locals);
+            if (binary.operator().equals("+") && left instanceof LiteralExpression leftLiteral
+                    && right instanceof LiteralExpression rightLiteral
+                    && leftLiteral.value() instanceof String leftText && rightLiteral.value() instanceof String rightText) {
+                return new LiteralExpression(binary.irVersion(), binary.sourceSpan(), leftText + rightText);
+            }
+            return new BinaryExpression(binary.irVersion(), binary.sourceSpan(), binary.operator(), left, right);
         }
         if (expression instanceof ArrayAccessExpression access) {
             return new ArrayAccessExpression(access.irVersion(), access.sourceSpan(),
-                    rewriteExpression(access.array(), context), rewriteExpression(access.index(), context));
+                    rewriteExpression(access.array(), context, locals), rewriteExpression(access.index(), context, locals));
         }
         if (expression instanceof AssignmentExpression assignment) {
-            return new AssignmentExpression(assignment.irVersion(), assignment.sourceSpan(), rewriteExpression(assignment.target(), context),
-                    rewriteExpression(assignment.value(), context));
+            return new AssignmentExpression(assignment.irVersion(), assignment.sourceSpan(),
+                    rewriteExpression(assignment.target(), context, locals), rewriteExpression(assignment.value(), context, locals));
         }
-        if (expression instanceof UpdateExpression update) return update;
+        if (expression instanceof UpdateExpression) return expression;
         if (expression instanceof UnaryExpression unary) {
-            return new UnaryExpression(unary.irVersion(), unary.sourceSpan(), unary.operator(),
-                    rewriteExpression(unary.operand(), context));
+            return new UnaryExpression(unary.irVersion(), unary.sourceSpan(), unary.operator(), rewriteExpression(unary.operand(), context, locals));
         }
-        if (expression instanceof CallExpression call) {
-            List<Expression> arguments = new ArrayList<>();
-            for (int i = 0; i < call.arguments().size(); i++) {
-                Expression argument = rewriteExpression(call.arguments().get(i), context);
-                if (i == 0 && context.from() != Language.JAVA && context.to() == Language.JAVA
-                        && call.callee().equals("printf") && argument instanceof LiteralExpression literal
-                        && literal.value() instanceof String format) {
-                    String javaFormat = format.replaceAll("(?<!%)%l([feg])", "%$1");
-                    argument = new LiteralExpression(literal.irVersion(), literal.sourceSpan(), javaFormat);
-                }
-                arguments.add(argument);
+        if (!(expression instanceof CallExpression call)) return expression;
+
+        List<Expression> arguments = new ArrayList<>();
+        for (int i = 0; i < call.arguments().size(); i++) {
+            Expression argument = rewriteExpression(call.arguments().get(i), context, locals);
+            if (i == 0 && context.from() != Language.JAVA && context.to() == Language.JAVA
+                    && call.callee().equals("printf") && argument instanceof LiteralExpression literal
+                    && literal.value() instanceof String format) {
+                argument = new LiteralExpression(literal.irVersion(), literal.sourceSpan(), normalizeJavaFloatFormat(format));
             }
-            String callee = mappings.getOrDefault(new MappingKey(context.from(), context.to(), call.callee()), call.callee());
-            return new CallExpression(call.irVersion(), call.sourceSpan(), callee, arguments);
+            arguments.add(argument);
         }
-        return expression;
+        String callee = mappings.getOrDefault(new MappingKey(context.from(), context.to(), call.callee()), call.callee());
+        boolean javaToC = context.from() == Language.JAVA && context.to() == Language.C;
+        boolean javaToCpp = context.from() == Language.JAVA && context.to() == Language.CPP;
+        if ((javaToC || javaToCpp) && (call.callee().equals("System.out.print") || call.callee().equals("System.out.println"))) {
+            boolean println = call.callee().equals("System.out.println");
+            if (arguments.isEmpty() && println) {
+                if (javaToC) return new CallExpression(call.irVersion(), call.sourceSpan(), "puts",
+                        List.of(new LiteralExpression(call.irVersion(), call.sourceSpan(), "")));
+                return cout(call, List.of(endl(call)));
+            }
+            String valueType = typeOf(call.arguments().getFirst(), locals);
+            if (javaToCpp) {
+                List<Expression> streamValues = new ArrayList<>(arguments);
+                if (println) streamValues.add(endl(call));
+                return cout(call, streamValues);
+            }
+            if (valueType.equals("string")) {
+                if (println) return new CallExpression(call.irVersion(), call.sourceSpan(), "puts", arguments);
+                LiteralExpression format = new LiteralExpression(call.irVersion(), call.sourceSpan(), "%s");
+                return new CallExpression(call.irVersion(), call.sourceSpan(), "printf", List.of(format, arguments.getFirst()));
+            }
+            String conversion = switch (valueType) {
+                case "int", "short" -> "%d";
+                case "char" -> "%c";
+                default -> throw new IllegalStateException("Unsupported Java print type reached rewrite: " + valueType);
+            };
+            LiteralExpression format = new LiteralExpression(call.irVersion(), call.sourceSpan(), conversion + (println ? "\n" : ""));
+            return new CallExpression(call.irVersion(), call.sourceSpan(), "printf", List.of(format, arguments.getFirst()));
+        }
+        return new CallExpression(call.irVersion(), call.sourceSpan(), callee, arguments);
     }
 
+    private CallExpression cout(CallExpression original, List<Expression> values) {
+        return new CallExpression(original.irVersion(), original.sourceSpan(), "__codebridge_cout", values);
+    }
+
+    private CallExpression endl(CallExpression original) {
+        return new CallExpression(original.irVersion(), original.sourceSpan(), "__codebridge_endl", List.of());
+    }
+
+    private String typeOf(Expression expression, Map<String, String> locals) {
+        if (expression instanceof NameExpression name) return locals.getOrDefault(name.name(), "unknown");
+        if (expression instanceof LiteralExpression literal) {
+            if (literal.value() instanceof String) return "string";
+            if (literal.value() instanceof Character) return "char";
+            if (literal.value() instanceof Byte || literal.value() instanceof Short) return "short";
+            if (literal.value() instanceof Number) return "int";
+        }
+        if (expression instanceof ArrayAccessExpression access && access.array() instanceof NameExpression arrayName) {
+            String arrayType = locals.getOrDefault(arrayName.name(), "unknown");
+            return arrayType.startsWith("array:") ? arrayType.substring("array:".length()) : "unknown";
+        }
+        if (expression instanceof UnaryExpression unary) return typeOf(unary.operand(), locals);
+        if (expression instanceof BinaryExpression binary) {
+            String left = typeOf(binary.left(), locals), right = typeOf(binary.right(), locals);
+            if (left.equals("string") || right.equals("string")) return "string";
+            if (left.equals("double") || right.equals("double")) return "double";
+            if (left.equals("float") || right.equals("float")) return "float";
+            if (left.equals("long") || right.equals("long")) return "long";
+            if (Set.of("int", "short", "char").contains(left) && Set.of("int", "short", "char").contains(right)) return "int";
+        }
+        return "unknown";
+    }
+    private String normalizeJavaFloatFormat(String format) {
+        StringBuilder normalized = new StringBuilder(format.length());
+        for (int i = 0; i < format.length();) {
+            if (format.charAt(i) != '%') {
+                normalized.append(format.charAt(i++));
+                continue;
+            }
+            normalized.append('%');
+            i++;
+            if (i < format.length() && format.charAt(i) == '%') {
+                normalized.append('%');
+                i++;
+                continue;
+            }
+            while (i < format.length() && "-#+ 0".indexOf(format.charAt(i)) >= 0) normalized.append(format.charAt(i++));
+            while (i < format.length() && Character.isDigit(format.charAt(i))) normalized.append(format.charAt(i++));
+            if (i < format.length() && format.charAt(i) == '.') {
+                normalized.append(format.charAt(i++));
+                while (i < format.length() && Character.isDigit(format.charAt(i))) normalized.append(format.charAt(i++));
+            }
+            if (i + 1 < format.length() && format.charAt(i) == 'l' && "feg".indexOf(format.charAt(i + 1)) >= 0) i++;
+            if (i < format.length()) normalized.append(format.charAt(i++));
+        }
+        return normalized.toString();
+    }
     private static Map<MappingKey, String> loadMappings() {
         InputStream resource = StandardLibraryCallRule.class.getResourceAsStream("/standard-library-mappings.tsv");
         if (resource == null) throw new IllegalStateException("Missing standard-library-mappings.tsv");

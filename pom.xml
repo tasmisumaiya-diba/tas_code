@@ -9,10 +9,11 @@
     <version>0.1.0-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>tasCode</name>
-    <description>Phase 0 Maven multi-module skeleton</description>
+    <description>Deterministic shared-IR conversion between supported C, C++, and Java subsets</description>
 
     <modules>
         <module>codebridge-core</module>
+        <module>codebridge-frontend-clang</module>
         <module>codebridge-lang-c</module>
         <module>codebridge-lang-cpp</module>
         <module>codebridge-lang-java</module>
@@ -26,6 +27,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>21</maven.compiler.release>
         <junit.version>5.11.4</junit.version>
+        <jackson.version>2.22.3</jackson.version>
     </properties>
 
     <dependencyManagement>

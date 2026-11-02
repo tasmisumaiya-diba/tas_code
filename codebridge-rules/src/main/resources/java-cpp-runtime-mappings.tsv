@@ -1,0 +1,9 @@
+# Java String method mappings: owner	method	arity	C++ mapping
+# These mappings apply to non-null Java String values represented by std::string.
+String	isEmpty	0	empty
+String	equals	1	==
+String	length	0	length
+String	startsWith	1	HELPER:__codebridge_starts_with
+String	endsWith	1	HELPER:__codebridge_ends_with
+String	contains	1	HELPER:__codebridge_contains
+String	concat	1	+

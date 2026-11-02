@@ -23,6 +23,9 @@ import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -37,6 +40,7 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
     private static final int MAX_REQUEST_BYTES = 1_000_000;
     private static final SecureRandom CSP_NONCE_GENERATOR = new SecureRandom();
     private final HttpServer server;
+    private final ThreadPoolExecutor executor;
     private final ConversionPipeline pipeline;
     private final ValidatedConversionService validated;
     private final CompilerValidationService compilerValidator;
@@ -58,12 +62,13 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
         server.createContext("/api/convert", this::convert);
         server.createContext("/api/analyze", this::analyze);
         server.createContext("/", this::index);
-        server.setExecutor(new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
+        this.executor = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(32), task -> {
                     Thread thread = new Thread(task, "codebridge-http");
                     thread.setDaemon(true);
                     return thread;
-                }, new ThreadPoolExecutor.CallerRunsPolicy()));
+                }, new ThreadPoolExecutor.CallerRunsPolicy());
+        server.setExecutor(executor);
     }
 
     private static HttpServer createBoundServer(InetSocketAddress address) throws IOException {
@@ -79,7 +84,10 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
 
     public void start() { server.start(); }
     public int port() { return server.getAddress().getPort(); }
-    @Override public void close() { server.stop(0); }
+    @Override public void close() {
+        server.stop(0);
+        executor.shutdownNow();
+    }
 
     public static void main(String[] args) throws IOException {
         ServerConfiguration configuration = ServerConfiguration.from(args, System.getenv());
@@ -129,7 +137,7 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
         byte[] bytes = exchange.getRequestBody().readNBytes(MAX_REQUEST_BYTES + 1);
         if (bytes.length > MAX_REQUEST_BYTES) { respond(exchange, 413, "{\"error\":\"request too large\"}"); return; }
         try {
-            Map<String, Object> request = JsonObject.parse(new String(bytes, StandardCharsets.UTF_8));
+            Map<String, Object> request = JsonObject.parse(decodeUtf8(bytes));
             Language language = Language.fromId(requiredString(request, "language"));
             String source = requiredString(request, "source");
             if (language != Language.C && language != Language.CPP) throw new IllegalArgumentException("language must be c or cpp");
@@ -152,7 +160,7 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
         byte[] bytes = exchange.getRequestBody().readNBytes(MAX_REQUEST_BYTES + 1);
         if (bytes.length > MAX_REQUEST_BYTES) { respond(exchange, 413, "{\"error\":\"request too large\"}"); return; }
         try {
-            Map<String, Object> request = JsonObject.parse(new String(bytes, StandardCharsets.UTF_8));
+            Map<String, Object> request = JsonObject.parse(decodeUtf8(bytes));
             Language from = Language.fromId(requiredString(request, "from"));
             Language to = Language.fromId(requiredString(request, "to"));
             String source = requiredString(request, "source");
@@ -227,6 +235,18 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
         Object value = map.get(key);
         if (!(value instanceof String string) || string.isBlank()) throw new IllegalArgumentException("Field '" + key + "' is required.");
         return string;
+    }
+
+    private static String decodeUtf8(byte[] bytes) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes))
+                    .toString();
+        } catch (CharacterCodingException exception) {
+            throw new IllegalArgumentException("Request body must be valid UTF-8.");
+        }
     }
 
     private static String optionalString(Map<String, Object> map, String key, String defaultValue) {

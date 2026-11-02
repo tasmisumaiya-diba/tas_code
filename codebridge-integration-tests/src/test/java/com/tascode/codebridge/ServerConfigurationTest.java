@@ -68,4 +68,22 @@ class ServerConfigurationTest {
             assertTrue(failure.getMessage().contains("already be in use"), failure.getMessage());
         }
     }
+
+    @Test void closingServerStopsItsHttpWorkerThreads() throws Exception {
+        var configuration = ServerConfiguration.from(new String[0], Map.of(
+                ServerConfiguration.BIND_ADDRESS_ENV, "127.0.0.1",
+                ServerConfiguration.PORT_ENV, "0"));
+        var server = new com.tascode.codebridge.web.CodeBridgeHttpServer(configuration.socketAddress());
+        server.start();
+        var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.port() + "/api/health")).GET().build();
+        assertEquals(200, HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString()).statusCode());
+
+        server.close();
+
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(2), () -> {
+            while (Thread.getAllStackTraces().keySet().stream().anyMatch(thread -> thread.getName().equals("codebridge-http"))) {
+                Thread.sleep(10);
+            }
+        });
+    }
 }

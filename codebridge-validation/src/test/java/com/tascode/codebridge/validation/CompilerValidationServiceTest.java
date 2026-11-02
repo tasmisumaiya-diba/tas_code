@@ -16,6 +16,18 @@ class CompilerValidationServiceTest {
         assertTrue(result.diagnostics().isEmpty());
     }
 
+    @Test void compilesPublicJavaTypesUsingTheirDeclaredFileName() {
+        var result = validator.validate(Language.JAVA,
+                "class Helper {} public class Example { public static int value() { return 42; } }");
+        assertEquals(ValidationStatus.VALID, result.status(), result.diagnostics().toString());
+    }
+
+    @Test void compilesJavaTypesWithPackageDeclarations() {
+        var result = validator.validate(Language.JAVA,
+                "package demo.validation; public class PackagedExample { public static int value() { return 42; } }");
+        assertEquals(ValidationStatus.VALID, result.status(), result.diagnostics().toString());
+    }
+
     @Test void reportsJavaCompilerDiagnosticsForInvalidSource() {
         var result = validator.validate(Language.JAVA,
                 "public class TasCodeGenerated { public static int value() { return missing; } }");

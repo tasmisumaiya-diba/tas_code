@@ -49,7 +49,7 @@ public final class ClangSemanticFrontend {
         if (language != Language.C && language != Language.CPP) return failure("CB-CLANG-LANGUAGE-UNSUPPORTED", "Clang frontend accepts C or C++ input.");
         if (source == null || source.isBlank()) return failure("CB-CLANG-SOURCE-EMPTY", "Source code is empty.");
         if (source.length() > MAX_SOURCE_CHARS) return failure("CB-CLANG-SOURCE-LIMIT", "Source exceeds the Clang frontend size limit.");
-        ProcessResult imageCheck = run(List.of(dockerExecutable, "image", "inspect", image), Duration.ofSeconds(5));
+        ProcessResult imageCheck = run(List.of(dockerExecutable, "image", "inspect", image), Duration.ofSeconds(5), null);
         if (imageCheck.failure != null) return failure("CB-CLANG-DOCKER-UNAVAILABLE", "Docker is not reachable: " + imageCheck.failure);
         if (imageCheck.timedOut) return failure("CB-CLANG-DOCKER-UNAVAILABLE", "Docker image inspection timed out.");
         if (imageCheck.exitCode != 0) {
@@ -66,7 +66,7 @@ public final class ClangSemanticFrontend {
             String absolute = sourcePath.toAbsolutePath().toString().replace('\\', '/');
             String standard = language == Language.C ? "c17" : "c++23";
             List<String> command = dockerCommand(dockerExecutable, image, container, absolute, fileName, language, standard);
-            ProcessResult execution = run(command, timeout);
+            ProcessResult execution = run(command, timeout, container);
             if (execution.failure != null) return failure("CB-CLANG-DOCKER-UNAVAILABLE", "Clang frontend could not start: " + execution.failure);
             if (execution.timedOut) {
                 killContainer(container);
@@ -104,32 +104,54 @@ public final class ClangSemanticFrontend {
                 image, languageFlag, standard, "/work/" + fileName);
     }
 
-    private static ProcessResult run(List<String> command, Duration timeout) {
+    private ProcessResult run(List<String> command, Duration timeout, String container) {
+        Process process = null;
         try {
-            Process process = new ProcessBuilder(command).start();
-            CompletableFuture<LimitedText> stdout = CompletableFuture.supplyAsync(() -> readLimited(process.getInputStream()));
-            CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readLimited(process.getErrorStream()).text());
+            process = new ProcessBuilder(command).start();
+            Process active = process;
+            CompletableFuture<LimitedText> stdout = CompletableFuture.supplyAsync(() -> readLimited(active.getInputStream()));
+            CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readLimited(active.getErrorStream()).text());
             process.getOutputStream().close();
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                process.descendants().forEach(ProcessHandle::destroyForcibly);
-                process.destroyForcibly();
+                terminateProcessTree(process);
+                process.waitFor(1, TimeUnit.SECONDS);
                 return new ProcessResult(-1, stdout.join().text(), stderr.join(), true, false, null);
             }
             LimitedText output = stdout.get(2, TimeUnit.SECONDS);
             return new ProcessResult(process.exitValue(), output.text(), stderr.get(2, TimeUnit.SECONDS), false, output.truncated(), null);
         } catch (IOException exception) {
+            if (process != null) terminateProcessTree(process);
             return new ProcessResult(-1, "", safeMessage(exception), false, false, safeMessage(exception));
         } catch (InterruptedException exception) {
+            if (process != null) terminateProcessTree(process);
+            if (container != null) killContainer(container);
             Thread.currentThread().interrupt();
             return new ProcessResult(-1, "", "Interrupted.", false, false, "Interrupted.");
         } catch (Exception exception) {
+            if (process != null) terminateProcessTree(process);
             return new ProcessResult(-1, "", safeMessage(exception), false, false, safeMessage(exception));
         }
     }
 
     private void killContainer(String name) {
-        try { new ProcessBuilder(dockerExecutable, "kill", name).start().waitFor(2, TimeUnit.SECONDS); }
-        catch (Exception ignored) { }
+        boolean restoreInterrupt = Thread.interrupted();
+        Process process = null;
+        try {
+            process = new ProcessBuilder(dockerExecutable, "kill", name).start();
+            if (!process.waitFor(2, TimeUnit.SECONDS)) terminateProcessTree(process);
+        } catch (InterruptedException interrupted) {
+            if (process != null) terminateProcessTree(process);
+            restoreInterrupt = true;
+        } catch (Exception ignored) {
+            if (process != null) terminateProcessTree(process);
+        } finally {
+            if (restoreInterrupt) Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void terminateProcessTree(Process process) {
+        process.descendants().forEach(ProcessHandle::destroyForcibly);
+        process.destroyForcibly();
     }
 
     private static LimitedText readLimited(InputStream input) {

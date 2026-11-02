@@ -1472,7 +1472,45 @@ class CodeBridgePipelineTest {
         assertTrue(targetRun.completed(), targetRun.message());
         assertEquals("Sum = 5", sourceRun.stdout());
         assertEquals(java.util.Optional.of(true), comparison.matches(), comparison.message());
-    }    @Test void dockerSandboxCanCompareJavaAndGeneratedCppWhenDockerIsAvailable() {
+    }
+
+    @Test void dockerSandboxCanCompareLiteralOutputCProgramWithGeneratedJavaWhenDockerIsAvailable() {
+        String source = """
+                #include <stdio.h>
+
+                int main() {
+                    // Print Name
+                    printf("Name   : Alexandra Abramov\\n");
+                    // Print Date of Birth
+                    printf("DOB    : July 14, 1975\\n");
+                    // Print Mobile Number
+                    printf("Mobile : 99-9999999999\\n");
+                    // Indicate successful execution
+                    return(0);
+                }
+                """;
+        var conversion = convert(Language.C, Language.JAVA, source);
+        assertTrue(conversion.successful(), () -> conversion.diagnostics().toString());
+        var comparison = new com.tascode.codebridge.validation.OutputEquivalenceService(
+                new com.tascode.codebridge.validation.DockerSandboxExecutionService())
+                .compare(Language.C, source, Language.JAVA, conversion.output().orElseThrow(), "");
+        var sourceRun = comparison.sourceExecution().orElseThrow(() -> new AssertionError(comparison.message()));
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                sourceRun.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.DOCKER_UNAVAILABLE
+                        && sourceRun.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.IMAGE_UNAVAILABLE,
+                sourceRun.message());
+        var targetRun = comparison.targetExecution().orElseThrow(() -> new AssertionError(comparison.message()));
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                targetRun.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.DOCKER_UNAVAILABLE
+                        && targetRun.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.IMAGE_UNAVAILABLE,
+                targetRun.message());
+        assertTrue(sourceRun.completed(), sourceRun.message());
+        assertTrue(targetRun.completed(), targetRun.message());
+        assertEquals("Name   : Alexandra Abramov\nDOB    : July 14, 1975\nMobile : 99-9999999999\n", sourceRun.stdout());
+        assertEquals(java.util.Optional.of(true), comparison.matches(), comparison.message());
+    }
+
+    @Test void dockerSandboxCanCompareJavaAndGeneratedCppWhenDockerIsAvailable() {
         String source = "public class JavaExample { public static void main(String[] args) { int a = 2; int b = 3; System.out.printf(\"Sum = %d\", a + b); } }";
         var conversion = convert(Language.JAVA, Language.CPP, source);
         assertTrue(conversion.successful(), () -> conversion.diagnostics().toString());

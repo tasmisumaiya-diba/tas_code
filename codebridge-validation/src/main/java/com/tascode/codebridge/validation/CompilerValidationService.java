@@ -74,7 +74,7 @@ public final class CompilerValidationService implements CompilationValidator {
         Path output = null;
         try {
             output = Files.createTempDirectory("tascode-java-compile-");
-            var unit = new StringJavaSource(source);
+            var unit = new StringJavaSource(source, DockerSandboxExecutionService.javaSourceFileName(source));
             var fileManager = compiler.getStandardFileManager(collector, null, StandardCharsets.UTF_8);
             try (fileManager) {
                 boolean success = Boolean.TRUE.equals(compiler.getTask(null, fileManager, collector,
@@ -127,36 +127,59 @@ public final class CompilerValidationService implements CompilationValidator {
 
         CompletableFuture<String> output = CompletableFuture.supplyAsync(
                 () -> readCompilerOutput(process.getInputStream()));
-        try (var input = process.getOutputStream()) {
-            input.write(source.getBytes(StandardCharsets.UTF_8));
-        } catch (IOException exception) {
-            process.destroyForcibly();
-            return result(language, ValidationStatus.INVALID, "CB-VALIDATE-COMPILER-INPUT",
-                    "Source could not be sent to the compiler.");
-        }
+        CompletableFuture<Void> sourceWriter = CompletableFuture.runAsync(() -> writeCompilerInput(process, source));
 
         try {
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly();
+                terminateProcessTree(process);
+                closeCompilerInput(process);
                 process.waitFor(1, TimeUnit.SECONDS);
+                awaitQuietly(sourceWriter);
                 output.cancel(true);
                 return result(language, ValidationStatus.TIMED_OUT, "CB-VALIDATE-TIMEOUT",
                         "Compilation exceeded the configured time limit.");
             }
+            awaitQuietly(sourceWriter);
             String compilerOutput = trimOutput(output.get(2, TimeUnit.SECONDS));
             if (process.exitValue() == 0) return new CompilationResult(language, ValidationStatus.VALID, List.of());
             String message = compilerOutput.isBlank() ? "The compiler rejected the generated source." : compilerOutput;
             return new CompilationResult(language, ValidationStatus.INVALID, List.of(nativeDiagnostic(message)));
         } catch (InterruptedException exception) {
-            process.destroyForcibly();
+            terminateProcessTree(process);
+            closeCompilerInput(process);
+            sourceWriter.cancel(true);
             Thread.currentThread().interrupt();
             return result(language, ValidationStatus.TIMED_OUT, "CB-VALIDATE-INTERRUPTED",
                     "Compilation was interrupted.");
         } catch (Exception exception) {
-            process.destroyForcibly();
+            terminateProcessTree(process);
+            closeCompilerInput(process);
+            sourceWriter.cancel(true);
             return result(language, ValidationStatus.INVALID, "CB-VALIDATE-COMPILER-FAILED",
                     "Compiler validation failed: " + safeMessage(exception));
         }
+    }
+
+    private static void writeCompilerInput(Process process, String source) {
+        try (var input = process.getOutputStream()) {
+            input.write(source.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+            // Compilers can exit early after rejecting input; the process result carries the diagnostic.
+        }
+    }
+
+    private static void closeCompilerInput(Process process) {
+        try { process.getOutputStream().close(); } catch (IOException ignored) { }
+    }
+
+    private static void terminateProcessTree(Process process) {
+        process.descendants().forEach(ProcessHandle::destroyForcibly);
+        process.destroyForcibly();
+    }
+
+    private static void awaitQuietly(CompletableFuture<Void> future) {
+        try { future.get(2, TimeUnit.SECONDS); }
+        catch (Exception ignored) { future.cancel(true); }
     }
 
     private static String readCompilerOutput(InputStream input) {
@@ -217,8 +240,8 @@ public final class CompilerValidationService implements CompilationValidator {
 
     private static final class StringJavaSource extends SimpleJavaFileObject {
         private final String source;
-        private StringJavaSource(String source) {
-            super(URI.create("string:///TasCodeGenerated.java"), Kind.SOURCE);
+        private StringJavaSource(String source, String fileName) {
+            super(URI.create("string:///" + fileName), Kind.SOURCE);
             this.source = source;
         }
         @Override public CharSequence getCharContent(boolean ignoreEncodingErrors) { return source; }

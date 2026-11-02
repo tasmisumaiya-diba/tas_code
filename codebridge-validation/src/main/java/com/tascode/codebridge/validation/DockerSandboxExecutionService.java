@@ -1,9 +1,9 @@
 package com.tascode.codebridge.validation;
 
 import com.tascode.codebridge.language.Language;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -69,7 +69,8 @@ public final class DockerSandboxExecutionService {
                 case JAVA -> javaSourceFileName(source);
             };
             Files.writeString(folder.resolve(fileName), source, StandardCharsets.UTF_8);
-            List<String> command = dockerCommand(language, folder, containerName, fileName, dockerExecutable);
+            String javaMainClass = language == Language.JAVA ? javaMainClass(source, fileName) : null;
+            List<String> command = dockerCommand(language, folder, containerName, fileName, javaMainClass, dockerExecutable);
             ProcessResult execution = runProcess(command, standardInput, timeout);
             if (execution.failure != null) return unavailable(language, execution.failure);
             if (execution.timedOut) {
@@ -91,11 +92,20 @@ public final class DockerSandboxExecutionService {
     }
 
     static List<String> dockerCommand(Language language, Path folder, String containerName, String fileName, String docker) {
+        return dockerCommand(language, folder, containerName, fileName,
+                language == Language.JAVA ? javaClassNameFromFile(fileName) : null, docker);
+    }
+
+    static List<String> dockerCommand(Language language, Path folder, String containerName, String fileName,
+            String javaMainClass, String docker) {
         String runCommand = switch (language) {
             case C -> "gcc -std=c11 -O0 -o /tmp/codebridge-program /workspace/program.c 2>/tmp/codebridge-build.err || { cat /tmp/codebridge-build.err >&2; echo CODEBRIDGE_COMPILER_FAILED >&2; exit 125; }; exec /tmp/codebridge-program";
             case CPP -> "g++ -std=c++20 -O0 -o /tmp/codebridge-program /workspace/program.cpp 2>/tmp/codebridge-build.err || { cat /tmp/codebridge-build.err >&2; echo CODEBRIDGE_COMPILER_FAILED >&2; exit 125; }; exec /tmp/codebridge-program";
             case JAVA -> {
-                String className = javaClassNameFromFile(fileName);
+                String className = Objects.requireNonNull(javaMainClass, "javaMainClass");
+                if (!className.matches("\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*(?:\\.\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)*")) {
+                    throw new IllegalArgumentException("Invalid Java main class name for sandbox execution.");
+                }
                 yield "mkdir -p /tmp/classes && javac --release 21 -proc:none -d /tmp/classes /workspace/" + fileName
                         + " 2>/tmp/codebridge-build.err || { cat /tmp/codebridge-build.err >&2; echo CODEBRIDGE_COMPILER_FAILED >&2; exit 125; }; exec java -cp /tmp/classes " + className;
             }
@@ -111,16 +121,75 @@ public final class DockerSandboxExecutionService {
         return List.copyOf(args);
     }
 
-    private static String javaSourceFileName(String source) {
-        Matcher matcher = Pattern.compile("\\bclass\\s+([A-Za-z_$][\\w$]*)").matcher(maskJavaCommentsAndLiterals(source));
-        return matcher.find() ? matcher.group(1) + ".java" : "TasCodeGenerated.java";
+    static String javaSourceFileName(String source) {
+        String masked = maskJavaCommentsAndLiterals(source);
+        int depth = 0;
+        int declarationStart = 0;
+        String firstTopLevelType = null;
+        for (int i = 0; i < masked.length();) {
+            char current = masked.charAt(i);
+            if (depth == 0 && (current == 'c' || current == 'i' || current == 'e' || current == 'r')) {
+                String typeKeyword = typeKeywordAt(masked, i);
+                if (typeKeyword != null) {
+                    int nameStart = skipWhitespace(masked, i + typeKeyword.length());
+                    int nameEnd = identifierEnd(masked, nameStart);
+                    if (nameEnd > nameStart) {
+                        String typeName = masked.substring(nameStart, nameEnd);
+                        if (firstTopLevelType == null) firstTopLevelType = typeName;
+                        if (containsPublicModifier(masked, declarationStart, i)) return typeName + ".java";
+                        i = nameEnd;
+                        continue;
+                    }
+                }
+            }
+            if (current == '{') depth++;
+            else if (current == '}' && depth > 0) {
+                depth--;
+                if (depth == 0) declarationStart = i + 1;
+            } else if (current == ';' && depth == 0) declarationStart = i + 1;
+            i++;
+        }
+        return (firstTopLevelType == null ? "TasCodeGenerated" : firstTopLevelType) + ".java";
+    }
+
+    private static String typeKeywordAt(String source, int at) {
+        for (String keyword : List.of("class", "interface", "enum", "record")) {
+            int end = at + keyword.length();
+            if (source.startsWith(keyword, at) && (at == 0 || !Character.isJavaIdentifierPart(source.charAt(at - 1)))
+                    && (end == source.length() || !Character.isJavaIdentifierPart(source.charAt(end)))) return keyword;
+        }
+        return null;
+    }
+
+    private static int skipWhitespace(String source, int at) {
+        while (at < source.length() && Character.isWhitespace(source.charAt(at))) at++;
+        return at;
+    }
+
+    private static int identifierEnd(String source, int at) {
+        if (at >= source.length() || !(Character.isJavaIdentifierStart(source.charAt(at)) || source.charAt(at) == '$')) return at;
+        at++;
+        while (at < source.length() && (Character.isJavaIdentifierPart(source.charAt(at)) || source.charAt(at) == '$')) at++;
+        return at;
+    }
+
+    private static boolean containsPublicModifier(String source, int start, int end) {
+        Matcher modifier = Pattern.compile("\\bpublic\\b").matcher(source.substring(start, end));
+        return modifier.find();
     }
 
     private static String javaClassNameFromFile(String fileName) {
-        if (!fileName.matches("[A-Za-z_$][\\w$]*\\.java")) {
+        if (!fileName.matches("\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*\\.java")) {
             throw new IllegalArgumentException("Invalid Java source file name for sandbox execution.");
         }
         return fileName.substring(0, fileName.length() - ".java".length());
+    }
+
+    static String javaMainClass(String source, String fileName) {
+        String simpleName = javaClassNameFromFile(fileName);
+        Matcher packageMatcher = Pattern.compile("\\bpackage\\s+(\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*(?:\\.\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)*)\\s*;")
+                .matcher(maskJavaCommentsAndLiterals(source));
+        return packageMatcher.find() ? packageMatcher.group(1) + "." + simpleName : simpleName;
     }
 
     private static String maskJavaCommentsAndLiterals(String source) {
@@ -166,7 +235,7 @@ public final class DockerSandboxExecutionService {
         return new SandboxExecutionResult(language, status, exitCode, stdout, stderr, message);
     }
 
-    private static ProcessResult runProcess(List<String> command, String input, Duration timeout) {
+    static ProcessResult runProcess(List<String> command, String input, Duration timeout) {
         Process process;
         try {
             process = new ProcessBuilder(command).start();
@@ -175,40 +244,71 @@ public final class DockerSandboxExecutionService {
         }
         CompletableFuture<String> stdout = CompletableFuture.supplyAsync(() -> readLimited(process.getInputStream()));
         CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> readLimited(process.getErrorStream()));
-        try (var stdin = process.getOutputStream()) {
-            stdin.write(input.getBytes(StandardCharsets.UTF_8));
-        } catch (IOException exception) {
-            process.destroyForcibly();
-            return ProcessResult.failed(safeMessage(exception));
-        }
+        CompletableFuture<Void> stdin = CompletableFuture.runAsync(() -> writeInput(process, input));
         try {
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                 process.descendants().forEach(ProcessHandle::destroyForcibly);
                 process.destroyForcibly();
+                closeStdin(process);
+                awaitQuietly(stdin);
                 return ProcessResult.timedOut(stdout.join(), stderr.join());
             }
+            awaitQuietly(stdin);
             return ProcessResult.completed(process.exitValue(), stdout.get(2, TimeUnit.SECONDS), stderr.get(2, TimeUnit.SECONDS));
         } catch (InterruptedException exception) {
             process.descendants().forEach(ProcessHandle::destroyForcibly);
             process.destroyForcibly();
+            closeStdin(process);
+            stdin.cancel(true);
             Thread.currentThread().interrupt();
             return ProcessResult.failed("Docker command was interrupted.");
         } catch (Exception exception) {
             process.destroyForcibly();
+            closeStdin(process);
+            stdin.cancel(true);
             return ProcessResult.failed(safeMessage(exception));
         }
     }
 
-    private static String readLimited(InputStream input) {
-        try (input; var kept = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[4096];
+    private static void writeInput(Process process, String input) {
+        try (var stdin = process.getOutputStream()) {
+            stdin.write(input.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+            // A child may exit without consuming all input; its exit status remains authoritative.
+        }
+    }
+
+    private static void closeStdin(Process process) {
+        try { process.getOutputStream().close(); } catch (IOException ignored) { }
+    }
+
+    private static void awaitQuietly(CompletableFuture<Void> future) {
+        try { future.get(2, TimeUnit.SECONDS); }
+        catch (Exception ignored) { future.cancel(true); }
+    }
+
+    static String readLimited(InputStream input) {
+        try (input; var reader = new InputStreamReader(input, StandardCharsets.UTF_8)) {
+            char[] buffer = new char[4096];
+            StringBuilder kept = new StringBuilder(MAX_OUTPUT_CHARS + OUTPUT_TRUNCATION_MARKER.length());
+            boolean truncated = false;
             int read;
-            while ((read = input.read(buffer)) != -1) {
-                int remaining = MAX_OUTPUT_CHARS * 4 - kept.size();
-                if (remaining > 0) kept.write(buffer, 0, Math.min(read, remaining));
+            while ((read = reader.read(buffer)) != -1) {
+                if (truncated) continue;
+                int remaining = MAX_OUTPUT_CHARS - kept.length();
+                if (read <= remaining) {
+                    kept.append(buffer, 0, read);
+                    continue;
+                }
+                int retained = Math.max(0, remaining);
+                kept.append(buffer, 0, retained);
+                if (!kept.isEmpty() && Character.isHighSurrogate(kept.charAt(kept.length() - 1))) {
+                    kept.setLength(kept.length() - 1);
+                }
+                truncated = true;
             }
-            String text = kept.toString(StandardCharsets.UTF_8);
-            return text.length() <= MAX_OUTPUT_CHARS ? text : text.substring(0, MAX_OUTPUT_CHARS) + OUTPUT_TRUNCATION_MARKER;
+            if (truncated) kept.append(OUTPUT_TRUNCATION_MARKER);
+            return kept.toString();
         } catch (IOException exception) {
             return "Output could not be read: " + safeMessage(exception);
         }
@@ -232,7 +332,7 @@ public final class DockerSandboxExecutionService {
         } catch (IOException ignored) { }
     }
 
-    private record ProcessResult(int exitCode, String stdout, String stderr, boolean timedOut, String failure) {
+    record ProcessResult(int exitCode, String stdout, String stderr, boolean timedOut, String failure) {
         static ProcessResult completed(int exitCode, String stdout, String stderr) {
             return new ProcessResult(exitCode, stdout, stderr, false, null);
         }

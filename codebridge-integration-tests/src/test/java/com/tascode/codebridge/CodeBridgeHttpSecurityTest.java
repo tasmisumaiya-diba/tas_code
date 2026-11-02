@@ -97,6 +97,23 @@ class CodeBridgeHttpSecurityTest {
         }
     }
 
+    @Test void apiRejectsMalformedUtf8InsteadOfSilentlyReplacingSourceBytes() throws Exception {
+        try (var server = new CodeBridgeHttpServer(new InetSocketAddress("127.0.0.1", 0))) {
+            server.start();
+            byte[] malformedJson = {'{', '"', 'x', '"', ':', '"', (byte) 0xC3, '"', '}'};
+            for (String path : new String[]{"/api/convert", "/api/analyze"}) {
+                var response = CLIENT.send(HttpRequest.newBuilder(uri(server, path))
+                                .header("Content-Type", "application/json")
+                                .POST(HttpRequest.BodyPublishers.ofByteArray(malformedJson))
+                                .build(), HttpResponse.BodyHandlers.ofString());
+
+                assertEquals(400, response.statusCode(), path);
+                assertTrue(response.body().contains("valid UTF-8"), response.body());
+                assertCommonHeaders(response);
+            }
+        }
+    }
+
     private static URI uri(CodeBridgeHttpServer server, String path) {
         return URI.create("http://127.0.0.1:" + server.port() + path);
     }

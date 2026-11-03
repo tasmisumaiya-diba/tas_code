@@ -128,26 +128,30 @@ The server reads these environment variables; the optional command-line port ove
 |---|---|---|
 | `CODEBRIDGE_BIND_ADDRESS` | `127.0.0.1` | Network interface/address to bind |
 | `CODEBRIDGE_PORT` | `8080` | HTTP listening port (`0` may be used for an ephemeral port in tests) |
+| `CODEBRIDGE_AUTH_TOKEN` | unset | Optional ASCII bearer token (at least 16 allowed characters) required by `/api/convert` and `/api/analyze` |
 
 PowerShell example:
 
 ```powershell
 $env:CODEBRIDGE_BIND_ADDRESS = '127.0.0.1'
 $env:CODEBRIDGE_PORT = '8080'
+# Optional: configure a long random token before starting the server.
+# The UI will prompt for it when API authentication is enabled.
+$env:CODEBRIDGE_AUTH_TOKEN = [guid]::NewGuid().ToString('N')
 .\run-codebridge.ps1
 ```
 
-For a reverse proxy on the same machine, the app can bind to `127.0.0.1`; let the proxy terminate TLS and forward requests to CodeBridge. If a container or separate proxy must reach it, set the bind address to the required private interface (often `0.0.0.0`) and restrict network access at the host/firewall. Do not expose this unauthenticated server directly to the public internet. The browser UI and API share the same origin, so the current deployment does not need cross-origin CORS access; no permissive CORS policy is enabled.
+For a reverse proxy on the same machine, the app can bind to `127.0.0.1`; let the proxy terminate TLS and forward requests to CodeBridge. If a container or separate proxy must reach it, set the bind address to the required private interface (often `0.0.0.0`) and restrict network access at the host/firewall. `CODEBRIDGE_AUTH_TOKEN` optionally protects conversion and analysis endpoints with HTTP bearer authentication; `/` and `/api/health` remain public so the UI and health probes work. The UI asks for the token when required and keeps it only in the current page memory. Do not send bearer tokens over untrusted plain HTTP or expose the service directly to the public internet. The browser UI and API share the same origin, so the current deployment does not need cross-origin CORS access; no permissive CORS policy is enabled.
 
-At startup, CodeBridge prints a warning to standard error if it binds to a non-loopback address because the HTTP service has no authentication or TLS.
+At startup, CodeBridge prints a warning to standard error if it binds to a non-loopback address because TLS is not provided by the app; when a token is configured, the warning notes that bearer authentication is enabled but still recommends a trusted network and TLS reverse proxy.
 
 HTTP responses include `nosniff`, frame denial, no-referrer, no-store caching, and a restrictive content security policy. The UI's inline script and style use per-response nonces. These browser protections do not replace authentication, TLS, a reverse proxy, or network restrictions.
 
 ## HTTP API
 
-- `GET /api/health` reports service status and version.
-- `POST /api/convert` converts source using `from`, `to`, and `source`.
-- `POST /api/analyze` returns a Clang semantic model for C or C++ source; it requires Docker and the local Clang image.
+- `GET /api/health` reports service status, version, and whether API bearer authentication is enabled.
+- `POST /api/convert` converts source using `from`, `to`, and `source`; send `Authorization: Bearer <token>` when `CODEBRIDGE_AUTH_TOKEN` is configured.
+- `POST /api/analyze` returns a Clang semantic model for C or C++ source; it requires Docker and the local Clang image, plus the bearer token when configured.
 
 Example PowerShell request:
 
@@ -256,8 +260,8 @@ Tests cover positive conversions, negative diagnostics, golden examples for all 
 - C/C++ pointers and references, global state, structs/unions, function pointers, `switch`, `goto`, and arbitrary preprocessor behavior are not generally translated.
 - Java object identity, null/GC behavior, UTF-16 details, C++ deterministic destruction/RAII, and C undefined or implementation-defined behavior can differ fundamentally; unsupported cases should be diagnosed rather than guessed.
 - Compiler checks validate generated syntax and types only. Behavioral equivalence requires executable entry points and the Docker comparison path; even then it compares stdout and exit status for the supplied input, not every possible input.
-- There is no file upload control, authentication, or public hosting configuration. The server is intended for local use and binds to loopback by default.
-- Environment-based bind configuration is available, but production deployment is not complete: there is no authentication, TLS termination, reverse-proxy configuration, container image for the Java service, or orchestrator/service definition. Keep it behind a trusted reverse proxy/network until those pieces are designed and verified.
+- There is no file upload control or public hosting configuration. The server is intended for local use and binds to loopback by default. Optional bearer authentication covers convert/analyze APIs; the UI, health route, and TLS still require network/reverse-proxy protection when deployed remotely.
+- Environment-based bind and optional API-token configuration are available, but production deployment is not complete: TLS termination, reverse-proxy configuration, container image for the Java service, and orchestrator/service definition remain unimplemented. Keep it behind a trusted reverse proxy/network.
 
 ## Development rules
 

@@ -4,6 +4,7 @@ Meaningful changes are recorded here. This project has not yet adopted tagged re
 
 ## 2026-11-03 — Unreleased
 
+- Finished wiring optional API bearer authentication: `CODEBRIDGE_AUTH_TOKEN` protects conversion and analysis APIs, `/api/health` advertises whether auth is required, and the UI prompts without CodeBridge persisting the token. Tokens are length/character validated and redacted from configuration text; startup warnings and README state TLS is still required for remote access. All six HTTP/configuration auth regression tests pass; see the roadmap for the full-suite result.
 - HTTP API now rejects malformed UTF-8 request bodies with a clear 400 response instead of silently replacing invalid byte sequences before JSON parsing; added coverage for both `/api/convert` and `/api/analyze`.
 - Java sandbox execution now selects the public top-level type when choosing the `.java` filename, avoiding false compile failures when nested or helper classes appear first; tests cover nested types, records, fallback selection, and comments.
 - Java sandbox execution now launches packaged programs using their fully qualified main-class name; added coverage for a package declaration that appears after a misleading comment.

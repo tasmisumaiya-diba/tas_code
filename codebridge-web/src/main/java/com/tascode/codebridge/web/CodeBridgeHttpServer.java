@@ -1,31 +1,33 @@
 package com.tascode.codebridge.web;
 
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import com.tascode.codebridge.CodeBridge;
 import com.tascode.codebridge.diagnostic.Diagnostic;
+import com.tascode.codebridge.frontend.clang.ClangIrLowerer;
+import com.tascode.codebridge.frontend.clang.ClangSemanticFrontend;
+import com.tascode.codebridge.frontend.clang.ClangSemanticModel;
 import com.tascode.codebridge.language.Language;
 import com.tascode.codebridge.pipeline.ConversionPipeline;
 import com.tascode.codebridge.pipeline.ConversionResult;
+import com.tascode.codebridge.preprocess.CPreprocessor;
 import com.tascode.codebridge.validation.CompilationResult;
 import com.tascode.codebridge.validation.CompilerValidationService;
-import com.tascode.codebridge.frontend.clang.ClangSemanticFrontend;
-import com.tascode.codebridge.frontend.clang.ClangIrLowerer;
-import com.tascode.codebridge.frontend.clang.ClangSemanticModel;
 import com.tascode.codebridge.validation.DockerSandboxExecutionService;
 import com.tascode.codebridge.validation.OutputComparisonResult;
 import com.tascode.codebridge.validation.OutputEquivalenceService;
 import com.tascode.codebridge.validation.SandboxExecutionResult;
 import com.tascode.codebridge.validation.ValidatedConversionService;
-import com.tascode.codebridge.preprocess.CPreprocessor;
 import java.io.IOException;
 import java.net.BindException;
 import java.net.InetSocketAddress;
-import java.security.SecureRandom;
-import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -41,6 +43,7 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
     private static final SecureRandom CSP_NONCE_GENERATOR = new SecureRandom();
     private final HttpServer server;
     private final ThreadPoolExecutor executor;
+    private final byte[] apiToken;
     private final ConversionPipeline pipeline;
     private final ValidatedConversionService validated;
     private final CompilerValidationService compilerValidator;
@@ -49,18 +52,28 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
     private final ClangIrLowerer clangIrLowerer = new ClangIrLowerer();
 
     public CodeBridgeHttpServer(InetSocketAddress address) throws IOException {
-        this(address, CodeBridge.createPipeline(), new CompilerValidationService());
+        this(address, CodeBridge.createPipeline(), new CompilerValidationService(), null);
     }
 
     CodeBridgeHttpServer(InetSocketAddress address, ConversionPipeline pipeline, CompilerValidationService validator) throws IOException {
+        this(address, pipeline, validator, null);
+    }
+
+    public CodeBridgeHttpServer(InetSocketAddress address, String apiToken) throws IOException {
+        this(address, CodeBridge.createPipeline(), new CompilerValidationService(), apiToken);
+    }
+
+    private CodeBridgeHttpServer(InetSocketAddress address, ConversionPipeline pipeline,
+            CompilerValidationService validator, String apiToken) throws IOException {
+        this.apiToken = apiToken == null ? null : validatedTokenBytes(apiToken);
         this.server = createBoundServer(address);
         this.pipeline = pipeline;
         this.validated = new ValidatedConversionService(pipeline, validator);
         this.compilerValidator = validator;
         this.equivalence = new OutputEquivalenceService(new DockerSandboxExecutionService());
         server.createContext("/api/health", this::health);
-        server.createContext("/api/convert", this::convert);
-        server.createContext("/api/analyze", this::analyze);
+        server.createContext("/api/convert", protectApi(this::convert));
+        server.createContext("/api/analyze", protectApi(this::analyze));
         server.createContext("/", this::index);
         this.executor = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(32), task -> {
@@ -91,12 +104,13 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
 
     public static void main(String[] args) throws IOException {
         ServerConfiguration configuration = ServerConfiguration.from(args, System.getenv());
-        CodeBridgeHttpServer app = new CodeBridgeHttpServer(configuration.socketAddress());
+        CodeBridgeHttpServer app = new CodeBridgeHttpServer(configuration.socketAddress(), configuration.authToken());
         Runtime.getRuntime().addShutdownHook(new Thread(app::close));
         app.start();
         if (!configuration.socketAddress().getAddress().isLoopbackAddress()) {
-            System.err.println("WARNING: CodeBridge is listening on a non-loopback address. "
-                    + "The HTTP server has no authentication or TLS; restrict access with a trusted network/firewall and reverse proxy.");
+            System.err.println("WARNING: CodeBridge is listening on a non-loopback address without TLS. "
+                    + (configuration.authenticationEnabled() ? "API bearer authentication is enabled, but still restrict access with a trusted network/firewall and reverse proxy."
+                    : "API authentication is disabled; restrict access with a trusted network/firewall and reverse proxy."));
         }
         System.out.println("CodeBridge listening on " + configuration.bindAddress() + ":" + app.port());
     }
@@ -104,7 +118,33 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
     private void health(HttpExchange exchange) throws IOException {
         if (!exchange.getRequestURI().getPath().equals("/api/health")) { respond(exchange, 404, "{\"error\":\"not found\"}"); return; }
         if (!exchange.getRequestMethod().equals("GET")) { respond(exchange, 405, "{\"error\":\"method not allowed\"}"); return; }
-        respond(exchange, 200, "{\"status\":\"ok\",\"version\":" + quote(CodeBridge.version()) + "}");
+        respond(exchange, 200, "{\"status\":\"ok\",\"version\":" + quote(CodeBridge.version())
+                + ",\"authenticationRequired\":" + (apiToken != null) + "}");
+    }
+
+    private HttpHandler protectApi(HttpHandler next) {
+        return exchange -> {
+            if (apiToken == null || hasValidBearerToken(exchange)) {
+                next.handle(exchange);
+                return;
+            }
+            exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer realm=\"codebridge\"");
+            respond(exchange, 401, "{\"error\":\"A valid CodeBridge API bearer token is required.\"}");
+        };
+    }
+
+    private boolean hasValidBearerToken(HttpExchange exchange) {
+        String authorization = exchange.getRequestHeaders().getFirst("Authorization");
+        byte[] supplied = new byte[0];
+        if (authorization != null && authorization.length() > 7 && authorization.regionMatches(true, 0, "Bearer ", 0, 7)) {
+            supplied = authorization.substring(7).getBytes(StandardCharsets.UTF_8);
+        }
+        return MessageDigest.isEqual(apiToken, supplied);
+    }
+
+    private static byte[] validatedTokenBytes(String token) {
+        ServerConfiguration.validateToken(token);
+        return token.getBytes(StandardCharsets.UTF_8);
     }
 
     private void index(HttpExchange exchange) throws IOException {

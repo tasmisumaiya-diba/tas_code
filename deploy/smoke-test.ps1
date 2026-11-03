@@ -40,17 +40,31 @@ function Invoke-CodeBridgeRequest {
         [switch] $Authenticated
     )
 
+    $url = '{0}{1}' -f $script:CodeBridgeBaseUri, $Path
     $curlArguments = @('--silent', '--show-error', '--write-out', "`n%{http_code}", '--request', $Method)
+    $bodyFile = $null
     if ($script:CodeBridgeCaCertificate) { $curlArguments += @('--cacert', $script:CodeBridgeCaCertificate) }
-    if ($Body -ne $null) { $curlArguments += @('--header', 'Content-Type: application/json', '--data-binary', $Body) }
-    $curlArguments += "$script:CodeBridgeBaseUri$Path"
+    if ($Body -ne $null) {
+        # Passing JSON as a native command argument is fragile in Windows PowerShell 5.
+        # Use a temporary UTF-8 file so curl receives the exact request bytes.
+        $bodyFile = [System.IO.Path]::GetTempFileName()
+        [System.IO.File]::WriteAllText($bodyFile, $Body, [System.Text.UTF8Encoding]::new($false))
+        $curlArguments += @('--header', 'Content-Type: application/json', '--data-binary', "@$bodyFile")
+    }
+    $curlArguments += @('--url', $url)
 
-    if ($Authenticated) {
-        $curlArguments += @('--config', '-')
-        $curlConfig = 'header = "Authorization: Bearer ' + $script:CodeBridgeToken + '"'
-        $rawResponse = ($curlConfig | & curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
-    } else {
-        $rawResponse = (& curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
+    try {
+        if ($Authenticated) {
+            $curlArguments = @('--config', '-') + $curlArguments
+            $curlConfig = 'header = "Authorization: Bearer ' + $script:CodeBridgeToken + '"'
+            $rawResponse = ($curlConfig | & curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
+        } else {
+            $rawResponse = (& curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
+        }
+    } finally {
+        if ($bodyFile -and (Test-Path -LiteralPath $bodyFile)) {
+            Remove-Item -LiteralPath $bodyFile -Force
+        }
     }
     $curlExitCode = $LASTEXITCODE
     if ($curlExitCode -ne 0) {
@@ -88,7 +102,7 @@ if ($unauthenticated.StatusCode -ne 401) { throw "Unauthenticated conversion ret
 Write-Host 'PASS: conversion API rejects requests without the bearer token.'
 
 $conversionResponse = Invoke-CodeBridgeRequest -Method POST -Path '/api/convert' -Body $requestBody -Authenticated
-if ($conversionResponse.StatusCode -ne 200) { throw "Authenticated conversion returned HTTP $($conversionResponse.StatusCode)." }
+if ($conversionResponse.StatusCode -ne 200) { throw "Authenticated conversion returned HTTP $($conversionResponse.StatusCode): $($conversionResponse.Body)" }
 $conversion = $conversionResponse.Body | ConvertFrom-Json
 if (-not $conversion.success -or $conversion.validation -ne 'VALID' -or -not $conversion.output) {
     throw "Authenticated conversion or Java compile validation failed: $($conversionResponse.Body)"

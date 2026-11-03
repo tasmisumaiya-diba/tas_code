@@ -43,10 +43,15 @@ function Invoke-CodeBridgeRequest {
     $curlArguments = @('--silent', '--show-error', '--write-out', "`n%{http_code}", '--request', $Method)
     if ($script:CodeBridgeCaCertificate) { $curlArguments += @('--cacert', $script:CodeBridgeCaCertificate) }
     if ($Body -ne $null) { $curlArguments += @('--header', 'Content-Type: application/json', '--data-binary', $Body) }
-    if ($Authenticated) { $curlArguments += @('--header', "Authorization: Bearer $script:CodeBridgeToken") }
     $curlArguments += "$script:CodeBridgeBaseUri$Path"
 
-    $rawResponse = (& curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
+    if ($Authenticated) {
+        $curlArguments += @('--config', '-')
+        $curlConfig = 'header = "Authorization: Bearer ' + $script:CodeBridgeToken + '"'
+        $rawResponse = ($curlConfig | & curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
+    } else {
+        $rawResponse = (& curl.exe @curlArguments 2>&1 | Out-String).TrimEnd("`r", "`n")
+    }
     $curlExitCode = $LASTEXITCODE
     if ($curlExitCode -ne 0) {
         throw "HTTPS request failed (curl exit $curlExitCode). Check the service, certificate trust, and URL."

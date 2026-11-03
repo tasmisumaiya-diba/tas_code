@@ -1,2 +1,4 @@
 .env.production
+.env.production.*
+!.env.production.example
 certs/

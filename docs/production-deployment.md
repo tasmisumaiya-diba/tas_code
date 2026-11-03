@@ -15,7 +15,7 @@ The app container does **not** receive the host Docker socket or Docker CLI. The
 ## Configure and launch
 
 1. Copy `deploy/.env.production.example` to `deploy/.env.production`.
-2. Replace `CODEBRIDGE_AUTH_TOKEN` with a randomly generated secret of at least 16 allowed characters. Keep this file private; it is ignored by Git.
+2. Generate a token with `[guid]::NewGuid().ToString('N')`, put it in `CODEBRIDGE_AUTH_TOKEN`, and save the file. Keep it private; it is ignored by Git.
 3. Put the certificate and key at `deploy/certs/fullchain.pem` and `deploy/certs/privkey.pem`. The `certs` directory is ignored by Git.
 4. Keep `CODEBRIDGE_HTTPS_BIND=127.0.0.1` for local-only access. For private LAN access, set it to the host's private interface address and configure the host firewall to allow only the intended clients. Do not use `0.0.0.0` without an explicit network and firewall review.
 5. From the repository root, build and start the stack:
@@ -28,10 +28,24 @@ The app container does **not** receive the host Docker socket or Docker CLI. The
 
    ```powershell
    docker compose --env-file deploy/.env.production -f deploy/compose.production.yaml ps
-   curl.exe --cacert path\to\trusted-ca.pem https://localhost:8443/api/health
+   .\deploy\smoke-test.ps1
    ```
 
-   For a trusted public certificate, use its normal trust chain rather than `--cacert`. The UI is at `https://localhost:8443/`. The API health response is public and reports that authentication is enabled; conversion and analysis requests require the token in `Authorization: Bearer <token>`.
+   The script checks that health and UI routes work over TLS, unauthenticated conversion is rejected, authenticated C-to-Java conversion compiles, and malformed JSON receives HTTP 400. It reads the token from the private env file without printing it. If your certificate is signed by a private CA, pass `-CaCertificate path\to\trusted-ca.pem`; for a certificate already trusted by Windows, no extra option is needed. The UI is at `https://localhost:8443/`. The API health response is public and reports that authentication is enabled; conversion and analysis requests require the token in `Authorization: Bearer <token>`.
+
+   To also confirm Nginx rate limiting, run `.\deploy\smoke-test.ps1 -CheckRateLimit` (plus `-CaCertificate` when needed). This sends a short burst of conversion requests and intentionally triggers one HTTP 429 response.
+
+For a local-only TLS smoke test, an OpenSSL self-signed certificate can be created with:
+
+```powershell
+New-Item -ItemType Directory -Force deploy/certs | Out-Null
+openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 2 `
+  -keyout deploy/certs/privkey.pem -out deploy/certs/fullchain.pem `
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" `
+  -addext "basicConstraints=critical,CA:TRUE"
+```
+
+Then pass `-CaCertificate .\deploy\certs\fullchain.pem` to the smoke script. This short-lived self-signed certificate is for local verification only; use a certificate from a trusted provider for LAN deployment.
 
 To stop the stack:
 
@@ -48,5 +62,6 @@ docker compose --env-file deploy/.env.production -f deploy/compose.production.ya
 - The app network is Docker-internal; only the Nginx proxy joins the edge network. There is no Docker socket mount.
 - Rotate `CODEBRIDGE_AUTH_TOKEN` by updating the private env file and recreating the app container. Do not commit secrets or certificates.
 - API bearer authentication is not a substitute for TLS. `CODEBRIDGE_AUTH_TOKEN` must be set for Compose to start.
+- After every image or proxy configuration change, rebuild the stack and rerun `deploy/smoke-test.ps1`. Save the tested image digests alongside the release notes.
 
 This setup does not include automatic certificate renewal, backups, high availability, a managed secret store, or centralized monitoring. Those depend on the selected host and certificate provider and must be arranged operationally.

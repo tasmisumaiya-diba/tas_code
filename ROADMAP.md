@@ -16,7 +16,7 @@ Status is based on the repository implementation and test suite, not on planned 
 
 - **Phase 2 — Clang AST lowering:** Scalar free functions, local variables, expressions, conditionals, and loop forms are supported in the opt-in route. The default C/C++ converters still use restricted parsers.
 - **Phase 6 — Semantic verification:** Tests cover representative conversions and compile checks. Actual Docker runtime equivalence depends on Docker being available and does not cover all inputs.
-- **Phase 8 — Production preparation:** The private-host deployment profile is implemented, but production release still needs a real certificate, firewall configuration, reviewed pinned image digests, and owner-host verification.
+- **Phase 8 — Production preparation:** The private-host deployment profile, setup guide, and end-to-end PowerShell smoke script are implemented. Production release still needs a real certificate, firewall configuration, reviewed pinned image digests, and execution of the smoke script on the owner host.
 
 ## Remaining work
 
@@ -39,13 +39,13 @@ Status is based on the repository implementation and test suite, not on planned 
 
 ## Next priorities
 
-1. Provision certificate and firewall settings, pin image digests, and execute an owner-host smoke test of the private deployment profile.
+1. Build/start the image with Docker Desktop, provision certificate and firewall settings, pin image digests, and execute `deploy/smoke-test.ps1` (including its optional rate-limit check) on the owner host.
 2. Add browser-driven tests for warning, comparison failure, and malformed-request rendering.
 3. Continue Clang-to-IR expansion from compiler-AST fixtures and Docker-backed tests in a configured environment.
 
 ## Latest verification
 
-Full verification: the offline Maven test suite was run from the repository root. Result: **BUILD SUCCESS**, 197 tests, 0 failures, 0 errors, 5 Docker-dependent skips. The suite includes bearer-authentication tests, API warning serialization, inconclusive output comparison handling, malformed JSON and UTF-8 behavior, route limits, conversion, compiler, and sandbox tests. The web packaging command also passed, and `docker compose config --quiet` accepted the production profile. Docker Engine was unavailable, so the image was not built or launched in this environment.
+Full verification: the offline Maven test suite was run from the repository root. Result: **BUILD SUCCESS**, 197 tests, 0 failures, 0 errors, 5 Docker-dependent skips. The suite includes bearer-authentication tests, API warning serialization, inconclusive output comparison handling, malformed JSON and UTF-8 behavior, route limits, conversion, compiler, and sandbox tests. The web packaging command also passed, and `docker compose config --quiet` accepted the production profile. Docker Engine was unavailable, so the image was not built or launched in this environment. The release smoke script passed PowerShell syntax validation but could not be run without the deployed TLS stack.
 
 Owner-run Docker verification: the targeted literal-output C-to-Java sandbox test passed (1 test, 0 failures, 0 skips), confirming compile/run equivalence for that sample on the owner's Docker Desktop environment.
 Owner-run IntelliJ verification: project owner reports the full test suite passed with Docker available. The owner also reports the targeted Docker C-to-Java runtime equivalence test passed.

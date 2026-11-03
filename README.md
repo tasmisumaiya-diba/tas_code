@@ -149,6 +149,8 @@ At startup, CodeBridge prints a warning to standard error if it binds to a non-l
 
 A single-host Docker Compose deployment is provided in [`docs/production-deployment.md`](docs/production-deployment.md). It publishes Nginx TLS on loopback by default, rate-limits API routes, requires an API token, and keeps the Java app on an internal container network. The app receives no Docker socket: Clang analysis and Docker run/compare are consequently unavailable in this deployment profile. Review the documented network boundary and firewall steps before allowing LAN access.
 
+After starting the deployment, run [`deploy/smoke-test.ps1`](deploy/smoke-test.ps1) to check HTTPS health/UI delivery, API authentication, conversion plus Java compile validation, and malformed-request handling. Add `-CheckRateLimit` to deliberately exercise Nginx's 429 response.
+
 HTTP responses include `nosniff`, frame denial, no-referrer, no-store caching, and a restrictive content security policy. The UI's inline script and style use per-response nonces. These browser protections do not replace authentication, TLS, a reverse proxy, or network restrictions.
 
 ## HTTP API

@@ -39,13 +39,13 @@ For a local-only TLS smoke test, an OpenSSL self-signed certificate can be creat
 
 ```powershell
 New-Item -ItemType Directory -Force deploy/certs | Out-Null
-openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 2 `
+openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 30 `
   -keyout deploy/certs/privkey.pem -out deploy/certs/fullchain.pem `
   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" `
   -addext "basicConstraints=critical,CA:TRUE"
 ```
 
-Then pass `-CaCertificate .\deploy\certs\fullchain.pem` to the smoke script. This short-lived self-signed certificate is for local verification only; use a certificate from a trusted provider for LAN deployment.
+Then pass `-CaCertificate .\deploy\certs\fullchain.pem` to the smoke script. This self-signed certificate is for local verification only; use a certificate from a trusted provider for LAN deployment.
 
 To stop the stack:
 

@@ -7,6 +7,7 @@ This page describes the implemented C-to-C++ converter subset in the current sha
 | C construct | Current handling |
 |---|---|
 | Function definitions and prototypes | Prototypes are removed from the IR; generated C++ emits declarations for the parsed functions so calls may precede definitions. |
+| Recursion | Direct self-recursion and mutual recursion are supported for functions in the supported scalar subset. Generated C and C++ place function declarations before definitions, and supported overloads are resolved by argument types. Recursion depth, termination, and stack limits remain program-dependent; no tail-call optimization is promised. |
 | Local primitive values | `void`, `char`, `short`, `int`, `long`, `float`, `double`, `_Bool`/`bool` within the parser's supported forms. C `long` stays C++ `long`; Java `long` stays C++ `long long`. |
 | Expressions | Literals (decimal, supported octal/hex, suffixed long), names, calls, one-dimensional array access, assignment and supported compound assignment, prefix/postfix increment/decrement, unary `+ - ! ~`, arithmetic, comparisons, bitwise and logical operators. |
 | Statements | Blocks, declarations, return, expression statements, `if/else`, `for`, `while`, `do/while`, `break`, and `continue`. |

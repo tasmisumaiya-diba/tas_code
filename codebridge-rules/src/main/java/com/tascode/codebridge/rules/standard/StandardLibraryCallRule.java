@@ -25,7 +25,8 @@ public final class StandardLibraryCallRule implements ConversionRule {
 
     @Override
     public boolean appliesTo(Language from, Language to, IrNode node) {
-        return node instanceof Program && mappings.keySet().stream().anyMatch(key -> key.from == from && key.to == to);
+        return node instanceof Program && ((from == Language.C && to == Language.CPP)
+                || mappings.keySet().stream().anyMatch(key -> key.from == from && key.to == to));
     }
 
     @Override public int priority() { return 100; }
@@ -65,6 +66,16 @@ public final class StandardLibraryCallRule implements ConversionRule {
                     returned.value().map(value -> rewriteExpression(value, context, locals)));
         }
         if (statement instanceof ExpressionStatement expression) {
+            if (context.from() == Language.C && context.to() == Language.JAVA
+                    && expression.expression() instanceof CallExpression call && call.callee().equals("printf")) {
+                CallExpression println = simpleIntegerPrintfLine(call, locals);
+                if (println != null) return new ExpressionStatement(expression.irVersion(), expression.sourceSpan(), println);
+            }
+            if (context.from() == Language.C && context.to() == Language.CPP
+                    && expression.expression() instanceof CallExpression call && call.callee().equals("printf")) {
+                CallExpression stream = simpleIntegerPrintf(call, locals);
+                if (stream != null) return new ExpressionStatement(expression.irVersion(), expression.sourceSpan(), stream);
+            }
             return new ExpressionStatement(expression.irVersion(), expression.sourceSpan(), rewriteExpression(expression.expression(), context, locals));
         }
         if (statement instanceof ForStatement loop) {
@@ -90,6 +101,71 @@ public final class StandardLibraryCallRule implements ConversionRule {
                     rewriteStatement(loop.body(), context, new HashMap<>(locals)));
         }
         return statement;
+    }
+
+    /** Rewrites only basic, semantically matching printf conversions; other formats stay as printf. */
+    private CallExpression simpleIntegerPrintf(CallExpression call, Map<String, String> locals) {
+        if (call.arguments().isEmpty() || !(call.arguments().getFirst() instanceof LiteralExpression literal)
+                || !(literal.value() instanceof String format)) return null;
+        if (call.arguments().stream().skip(1).anyMatch(argument -> !isSideEffectFree(argument))) return null;
+        List<Expression> streamItems = new ArrayList<>();
+        StringBuilder text = new StringBuilder();
+        int argument = 1;
+        for (int i = 0; i < format.length(); i++) {
+            char current = format.charAt(i);
+            if (current != '%') { text.append(current); continue; }
+            if (i + 1 >= format.length()) return null;
+            char conversion = format.charAt(++i);
+            if (conversion == '%') { text.append('%'); continue; }
+            if (argument >= call.arguments().size()) return null;
+            Expression value = call.arguments().get(argument++);
+            String valueType = typeOf(value, locals);
+            if (conversion == 'd' && !Set.of("int", "short").contains(valueType)) return null;
+            if (conversion == 's' && (!(value instanceof LiteralExpression stringLiteral)
+                    || !(stringLiteral.value() instanceof String))) return null;
+            if (conversion == 'c' && !valueType.equals("char")) return null;
+            if (conversion != 'd' && conversion != 's' && conversion != 'c') return null;
+            appendTextItems(streamItems, literal, text);
+            streamItems.add(value);
+        }
+        if (argument != call.arguments().size()) return null;
+        appendTextItems(streamItems, literal, text);
+        return new CallExpression(call.irVersion(), call.sourceSpan(), "__codebridge_cout", streamItems);
+    }
+
+    /** Maps the common single integer line-print to Java's idiomatic println without changing return-value uses. */
+    private CallExpression simpleIntegerPrintfLine(CallExpression call, Map<String, String> locals) {
+        if (call.arguments().size() != 2 || !(call.arguments().getFirst() instanceof LiteralExpression formatLiteral)
+                || !"%d\n".equals(formatLiteral.value())) return null;
+        Expression value = call.arguments().get(1);
+        if (!Set.of("int", "short").contains(typeOf(value, locals))) return null;
+        return new CallExpression(call.irVersion(), call.sourceSpan(), "System.out.println", List.of(value));
+    }
+
+    private void appendTextItems(List<Expression> items, LiteralExpression format, StringBuilder text) {
+        String value = text.toString();
+        text.setLength(0);
+        StringBuilder segment = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            if (character == '\n') {
+                if (!segment.isEmpty()) items.add(new LiteralExpression(format.irVersion(), format.sourceSpan(), segment.toString()));
+                segment.setLength(0);
+                items.add(new LiteralExpression(format.irVersion(), format.sourceSpan(), '\n'));
+            } else segment.append(character);
+        }
+        if (!segment.isEmpty()) items.add(new LiteralExpression(format.irVersion(), format.sourceSpan(), segment.toString()));
+    }
+
+    private boolean isSideEffectFree(Expression expression) {
+        if (expression instanceof NameExpression || expression instanceof LiteralExpression) return true;
+        if (expression instanceof BinaryExpression binary)
+            return isSideEffectFree(binary.left()) && isSideEffectFree(binary.right());
+        if (expression instanceof UnaryExpression unary)
+            return isSideEffectFree(unary.operand()) && !Set.of("++", "--").contains(unary.operator());
+        if (expression instanceof ArrayAccessExpression access)
+            return isSideEffectFree(access.array()) && isSideEffectFree(access.index());
+        return false;
     }
 
     private Expression rewriteExpression(Expression expression, RuleContext context, Map<String, String> locals) {
@@ -141,6 +217,8 @@ public final class StandardLibraryCallRule implements ConversionRule {
             if (javaToCpp) {
                 List<Expression> streamValues = new ArrayList<>(arguments);
                 if (println) streamValues.add(endl(call));
+                if (valueType.equals("bool"))
+                    return new CallExpression(call.irVersion(), call.sourceSpan(), "__codebridge_cout_bool", streamValues);
                 return cout(call, streamValues);
             }
             if (valueType.equals("string")) {

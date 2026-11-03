@@ -14,7 +14,12 @@ import java.util.Optional;
 public final class SubsetFunctionParser implements LanguageParser {
     private static final int V=1;
     private final Language language;
-    public SubsetFunctionParser(Language language) { this.language = java.util.Objects.requireNonNull(language); }
+    private final java.util.Set<String> knownTypes;
+    public SubsetFunctionParser(Language language) { this(language, java.util.Set.of()); }
+    public SubsetFunctionParser(Language language, java.util.Set<String> knownTypes) {
+        this.language = java.util.Objects.requireNonNull(language);
+        this.knownTypes = java.util.Set.copyOf(knownTypes);
+    }
     private List<Token> tokens; private int at; private int loopDepth; private boolean parsingStreamChain;
     @Override public Language language(){ return language; }
     @Override public synchronized ParseResult parse(String source){
@@ -94,7 +99,65 @@ public final class SubsetFunctionParser implements LanguageParser {
     private static final String[][] OPS={{"||"},{"&&"},{"|"},{"^"},{"&"},{"==","!="},{"<",">","<=",">="},{"<<",">>"},{"+","-"},{"*","/","%"}};
     private Expression binary(int min){Expression left=primary();while(true){int p=precedence(peek().text);if(p<min)break;Token op=advance();Expression right=binary(p+1);left=new BinaryExpression(V,span(tokenAt(left.sourceSpan()),previous()),op.text,left,right);}return left;}
     private Token tokenAt(SourceSpan s){return new Token(Kind.ID,"",s);}
-    private Expression primary(){if(check("++")||check("--")){Token operator=advance();Expression operand=primary();if(!(operand instanceof NameExpression target))throw fail("increment and decrement require a local name",operator);return new UpdateExpression(V,span(operator,tokenAt(operand.sourceSpan())),target,operator.text,true);}if(check("!")||check("-")||check("+")||check("~")){Token operator=advance();Expression operand=primary();return new UnaryExpression(V,span(operator,tokenAt(operand.sourceSpan())),operator.text,operand);}Token t=advance();if(t.kind==Kind.NUMBER){String n=t.text;char last=n.charAt(n.length()-1);return n.indexOf(46)>=0||n.indexOf(101)>=0||n.indexOf(69)>=0||last==70||last==102||last==68||last==100?floatingLiteral(t):integerLiteral(t);}if(t.kind==Kind.STRING)return new LiteralExpression(V,t.span(),decodeString(t));if(t.kind==Kind.CHARACTER)return new LiteralExpression(V,t.span(),decodeCharacter(t));if(t.kind==Kind.ID){if(t.text.equals("true")||t.text.equals("false"))return new LiteralExpression(V,t.span(),Boolean.parseBoolean(t.text));StringBuilder callee=new StringBuilder(t.text);boolean qualified=false;while(check(".")||check("::")){qualified=true;callee.append(advance().text);callee.append(expect(Kind.ID,"expected name after qualifier").text);}if((language==Language.CPP&&(callee.toString().equals("std::cin")||callee.toString().equals("cin")))&&match(">>")){List<Expression> targets=cinTargets();return new CallExpression(V,span(t,previous()),"__codebridge_cin",targets);}if((callee.toString().equals("std::cout")||callee.toString().equals("cout"))&&match("<<")){List<Expression> items=streamArguments();return new CallExpression(V,span(t,previous()),"__codebridge_cout",items);}if(match("(")){List<Expression> args=callArguments(callee.toString());return new CallExpression(V,span(t,previous()),callee.toString(),args);}if(qualified)throw fail("qualified names are supported only for function calls",t);NameExpression name=new NameExpression(V,t.span(),t.text);if(match("[")){Expression index=expression();expect("]");return new ArrayAccessExpression(V,span(t,previous()),name,index);}if(check("++")||check("--")){Token operator=advance();return new UpdateExpression(V,span(t,previous()),name,operator.text,false);}return name;}if(t.text.equals("(")){Expression e=expression();expect(")");return e;}throw fail("expected expression",t);}
+    private Expression primary() {
+        if (check("++") || check("--")) {
+            Token operator = advance();
+            Expression operand = primary();
+            if (!(operand instanceof NameExpression target)) throw fail("increment and decrement require a local name", operator);
+            return new UpdateExpression(V, span(operator, tokenAt(operand.sourceSpan())), target, operator.text, true);
+        }
+        if (check("!") || check("-") || check("+") || check("~")) {
+            Token operator = advance();
+            Expression operand = primary();
+            return new UnaryExpression(V, span(operator, tokenAt(operand.sourceSpan())), operator.text, operand);
+        }
+        Token token = advance();
+        if (token.kind == Kind.NUMBER) {
+            String number = token.text;
+            char last = number.charAt(number.length() - 1);
+            return number.indexOf('.') >= 0 || number.indexOf('e') >= 0 || number.indexOf('E') >= 0
+                    || last == 'F' || last == 'f' || last == 'D' || last == 'd'
+                    ? floatingLiteral(token) : integerLiteral(token);
+        }
+        if (token.kind == Kind.STRING) return new LiteralExpression(V, token.span(), decodeString(token));
+        if (token.kind == Kind.CHARACTER) return new LiteralExpression(V, token.span(), decodeCharacter(token));
+        if (token.kind == Kind.ID) {
+            if (token.text.equals("true") || token.text.equals("false"))
+                return new LiteralExpression(V, token.span(), Boolean.parseBoolean(token.text));
+            StringBuilder qualifiedName = new StringBuilder(token.text);
+            boolean qualified = false;
+            while (check(".") || check("::")) {
+                qualified = true;
+                qualifiedName.append(advance().text);
+                qualifiedName.append(expect(Kind.ID, "expected name after qualifier").text);
+            }
+            String name = qualifiedName.toString();
+            if (language == Language.CPP && (name.equals("std::cin") || name.equals("cin")) && match(">>"))
+                return new CallExpression(V, span(token, previous()), "__codebridge_cin", cinTargets());
+            if ((name.equals("std::cout") || name.equals("cout")) && match("<<"))
+                return new CallExpression(V, span(token, previous()), "__codebridge_cout", streamArguments());
+            if (match("(")) return new CallExpression(V, span(token, previous()), name, callArguments(name));
+            if (qualified && (language != Language.JAVA || name.contains("::") || name.indexOf('.') != name.lastIndexOf('.')))
+                throw fail("qualified values are supported only for a single Java object field access", token);
+            NameExpression expression = new NameExpression(V, qualified ? span(token, previous()) : token.span(), name);
+            if (match("[")) {
+                Expression index = expression();
+                expect("]");
+                return new ArrayAccessExpression(V, span(token, previous()), expression, index);
+            }
+            if (check("++") || check("--")) {
+                Token operator = advance();
+                return new UpdateExpression(V, span(token, previous()), expression, operator.text, false);
+            }
+            return expression;
+        }
+        if (token.text.equals("(")) {
+            Expression expression = expression();
+            expect(")");
+            return expression;
+        }
+        throw fail("expected expression", token);
+    }
     private LiteralExpression integerLiteral(Token token) {
         String digits = token.text;
         if (digits.matches("(?i).*[u].*")) throw fail("unsigned integer literals are outside the supported subset", token);
@@ -171,7 +234,7 @@ public final class SubsetFunctionParser implements LanguageParser {
         expect(")");
         return arguments;
     }    private int precedence(String op){if(parsingStreamChain&&op.equals("<<"))return -1;for(int i=0;i<OPS.length;i++)for(String candidate:OPS[i])if(candidate.equals(op))return i;return -1;}
-    private boolean isType(String s){return List.of("int","long","short","char","float","double","_Bool","bool","string","String").contains(s)||(language==Language.JAVA&&s.equals("byte"))||(language==Language.CPP&&s.equals("std")&&List.of("string","vector","int8_t").contains(look(2).text));} private String readType(Token first){if(language==Language.CPP&&first.text.equals("std")){expect("::");Token name=expect(Kind.ID,"expected string, int8_t, or vector after std::");if(name.text.equals("vector")){expect("<");Token element=expect(Kind.ID,"expected vector element type");String elementType=readType(element);expect(">");return elementType+"[]";}if(name.text.equals("int8_t"))return "byte";if(!name.text.equals("string"))throw fail("only std::string, std::int8_t, and supported std::vector types are accepted",name);return "string";}if(language==Language.CPP&&first.text.equals("long")){if(match("long"))return "long";return "c-long";}if(language==Language.C&&first.text.equals("long"))return "c-long";return first.text;}
+    private boolean isType(String s){return knownTypes.contains(s)||List.of("int","long","short","char","float","double","_Bool","bool","string","String").contains(s)||(language==Language.JAVA&&s.equals("byte"))||(language==Language.CPP&&s.equals("std")&&List.of("string","vector","int8_t").contains(look(2).text));} private String readType(Token first){if(language==Language.CPP&&first.text.equals("std")){expect("::");Token name=expect(Kind.ID,"expected string, int8_t, or vector after std::");if(name.text.equals("vector")){expect("<");Token element=expect(Kind.ID,"expected vector element type");String elementType=readType(element);expect(">");return elementType+"[]";}if(name.text.equals("int8_t"))return "byte";if(!name.text.equals("string"))throw fail("only std::string, std::int8_t, and supported std::vector types are accepted",name);return "string";}if(language==Language.CPP&&first.text.equals("long")){if(match("long"))return "long";return "c-long";}if(language==Language.C&&first.text.equals("long"))return "c-long";return first.text;}
     private List<Token> lex(String source) {
         List<Token> out = new ArrayList<>();
         int i = 0, line = 1, column = 1;

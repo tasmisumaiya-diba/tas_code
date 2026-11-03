@@ -20,7 +20,7 @@ public final class JavaParser implements LanguageParser {
     private static final Pattern GENERIC_SYNTAX = Pattern.compile("\\b(?:class\\s+[A-Za-z_$][\\w$]*|List|ArrayList|Map|HashMap|Set|HashSet|Collection|Optional|Queue|Deque)\\s*<");
     private static final Pattern EXCEPTION_SYNTAX = Pattern.compile("\\b(?:try|catch|throw|throws)\\b");
     private static final List<UnsupportedJavaSyntax> UNSUPPORTED_SYNTAX = List.of(
-            new UnsupportedJavaSyntax(Pattern.compile("(?m)^\\s*(?:package|import)\\b"), "CB-JAVA-IMPORT-UNSUPPORTED", "Java packages and imports are outside the supported single-class subset."),
+            new UnsupportedJavaSyntax(Pattern.compile("(?m)^\\s*(?:package|import)\\b"), "CB-JAVA-IMPORT-UNSUPPORTED", "Java packages and imports are outside the supported single-class subset, except java.util.Scanner for basic console input."),
             new UnsupportedJavaSyntax(Pattern.compile("\\bfor\\s*\\([^;()]+:\\s*[^)]+\\)"), "CB-JAVA-ENHANCED-FOR-UNSUPPORTED", "Java enhanced-for loops require iterable and iterator semantics that are not represented in the current IR."),
             new UnsupportedJavaSyntax(Pattern.compile("\\(\\s*(?:byte|short|int|long|float|double|char|boolean|String)\\s*\\)\\s*(?=[\\w(])"), "CB-JAVA-CAST-UNSUPPORTED", "Java casts are outside the supported subset because narrowing and reference-cast behavior cannot be preserved generally."),
             new UnsupportedJavaSyntax(Pattern.compile("\\b(?:this|super)\\b"), "CB-JAVA-INSTANCE-REFERENCE-UNSUPPORTED", "Java this/super references require object state and dispatch semantics that the function IR does not represent."),
@@ -34,7 +34,7 @@ public final class JavaParser implements LanguageParser {
             new UnsupportedJavaSyntax(Pattern.compile("@[A-Za-z_$][\\w$]*"), "CB-JAVA-ANNOTATION-UNSUPPORTED", "Java annotations are not preserved by the current C++ generator."),
             new UnsupportedJavaSyntax(Pattern.compile("\\b(?:record|sealed|permits|native)\\b"), "CB-JAVA-MODERN-TYPE-UNSUPPORTED", "Java records, sealed declarations, and native methods are outside the supported subset."),
             new UnsupportedJavaSyntax(Pattern.compile("\\[\\s*\\]\\s*\\[\\s*\\]"), "CB-JAVA-MULTIDIMENSIONAL-ARRAY-UNSUPPORTED", "Only one-dimensional Java arrays are represented in the shared IR."));
-    private static final List<String> MODIFIERS = List.of("public", "static", "strictfp");
+    private static final List<String> MODIFIERS = List.of("public", "private", "protected", "static", "strictfp");
     private final SubsetFunctionParser functionParser = new SubsetFunctionParser(Language.JAVA);
     private final JavaAstFrontend frontend = new JavaAstFrontend();
 
@@ -44,11 +44,27 @@ public final class JavaParser implements LanguageParser {
         if (source == null || source.isBlank()) {
             return new ParseResult(null, List.of(Diagnostic.withoutLocation(Severity.ERROR, "CB-PARSE-EMPTY", "Source code is empty.")));
         }
+        String originalSource = source;
         JavaAstFrontend.Result frontendResult = frontend.parse(source);
         if (frontendResult.model().isEmpty()) return new ParseResult(null, frontendResult.diagnostics());
+        ScannerLowering scannerLowering = lowerScannerInput(source, frontendResult.model().orElseThrow());
+        if (!scannerLowering.diagnostics().isEmpty()) return new ParseResult(null, scannerLowering.diagnostics());
+        source = scannerLowering.source();
         FieldExtraction fieldExtraction = extractPrimitiveStaticFields(source, frontendResult.model().orElseThrow());
         if (!fieldExtraction.diagnostics().isEmpty()) return new ParseResult(null, fieldExtraction.diagnostics());
         source = fieldExtraction.source();
+        String className = frontendResult.model().orElseThrow().types().getFirst().name();
+        java.util.Set<String> stackObjects = fieldExtraction.classes().isEmpty()
+                ? java.util.Set.of() : simpleObjectNames(source, className);
+        if (!stackObjects.isEmpty()) source = normalizeSimpleObjectDeclarations(source, className);
+        if (!stackObjects.isEmpty()) {
+            String objectNames = stackObjects.stream().map(Pattern::quote).collect(java.util.stream.Collectors.joining("|", "(?:", ")"));
+            Matcher alias = Pattern.compile("\\b" + Pattern.quote(className) + "\\s+[A-Za-z_$][\\w$]*\\s*=").matcher(maskCommentsAndLiterals(source));
+            Matcher reassignment = Pattern.compile("\\b" + objectNames + "\\s*=\\s*(?:" + objectNames + ")\\b").matcher(maskCommentsAndLiterals(source));
+            if (alias.find() || reassignment.find()) return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR,
+                    "CB-JAVA-OBJECT-ALIAS-UNSUPPORTED", "Java object variables are references; copying or reassigning them would change alias behavior in C++. Use separately constructed local objects.",
+                    location(source, alias.find(0) ? alias.start() : reassignment.find(0) ? reassignment.start() : 0))));
+        }
         String syntax = maskCommentsAndLiterals(source);
         for (UnsupportedJavaSyntax unsupported : UNSUPPORTED_SYNTAX) {
             Matcher matcher = unsupported.pattern().matcher(syntax);
@@ -69,9 +85,26 @@ public final class JavaParser implements LanguageParser {
         Matcher interfaceHeader = INTERFACE_HEADER.matcher(syntax);
         if (interfaceHeader.find()) return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-JAVA-INTERFACE-UNSUPPORTED",
                 "Java interfaces are outside the supported static-function subset.", location(source, interfaceHeader.start()))));
-        Matcher restrictedAccess = Pattern.compile("\\b(?:private|protected)\\b").matcher(syntax);
-        if (restrictedAccess.find()) return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-JAVA-ACCESS-UNSUPPORTED",
-                "Private and protected members cannot be flattened without changing their visibility.", location(source, restrictedAccess.start()))));
+        for (JavaFrontendModel.MemberModel member : frontendResult.model().orElseThrow().types().getFirst().members()) {
+            if (member.kind().equals("METHOD") && !member.name().equals("<init>")
+                    && (member.type().map(type -> type.name().equals(className)).orElse(false)
+                    || member.parameterTypes().stream().anyMatch(type -> type.name().equals(className)))) {
+                return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-JAVA-OBJECT-REFERENCE-UNSUPPORTED",
+                        "Object-valued parameters and returns use Java reference identity; only local no-argument object construction is supported.", member.sourceSpan())));
+            }
+            if (member.kind().equals("METHOD") && member.modifiers().contains("static")
+                    && (member.modifiers().contains("private") || member.modifiers().contains("protected"))) {
+                return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-JAVA-ACCESS-UNSUPPORTED",
+                        "Private or protected static methods cannot be flattened into C++ free functions without changing visibility.", member.sourceSpan())));
+            }
+            if (member.kind().equals("METHOD") && !member.name().equals("<init>")
+                    && !member.modifiers().contains("static")
+                    && !member.modifiers().contains("public") && !member.modifiers().contains("private")
+                    && !member.modifiers().contains("protected")) {
+                return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-JAVA-ACCESS-UNSUPPORTED",
+                        "Package-private instance methods have no direct C++ access equivalent; declare the method public, protected, or private.", member.sourceSpan())));
+            }
+        }
         Matcher synchronizedMethod = Pattern.compile("\\bsynchronized\\b").matcher(syntax);
         if (synchronizedMethod.find()) return new ParseResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-JAVA-THREADING-UNSUPPORTED",
                 "Synchronized Java code is outside the supported subset because thread-safety semantics cannot be preserved.", location(source, synchronizedMethod.start()))));
@@ -86,9 +119,13 @@ public final class JavaParser implements LanguageParser {
                 "Java generics and parameterized collection types are outside the supported subset.", location(source, genericAt))));
         try {
             String normalized = normalizeBooleanTypes(normalizeJavaEntryPoint(extractAndNormalizeClass(source)));
-            ParseResult result = functionParser.parse(normalized);
-            if (result.successful() && result.root() instanceof com.tascode.codebridge.ir.Program program)
-                return new ParseResult(new com.tascode.codebridge.ir.Program(program.irVersion(), program.sourceSpan(), program.functions(), program.includes(), fieldExtraction.globals(), List.of(), fieldExtraction.classes()), result.diagnostics(), frontendResult.diagnostics());
+            ParseResult result = new SubsetFunctionParser(Language.JAVA,
+                    java.util.Set.of(frontendResult.model().orElseThrow().types().getFirst().name())).parse(normalized);
+            if (result.successful() && result.root() instanceof com.tascode.codebridge.ir.Program program) {
+                var lowered = attachInstanceMethods(program, fieldExtraction, originalSource);
+                if (!lowered.diagnostics().isEmpty()) return new ParseResult(null, lowered.diagnostics());
+                return new ParseResult(lowered.program(), result.diagnostics(), frontendResult.diagnostics());
+            }
             if (fieldExtraction.classes().size() > 0 && isTrivia(normalized))
                 return new ParseResult(new com.tascode.codebridge.ir.Program(1, SourceSpan.point(1, 1), List.of(), List.of(), fieldExtraction.globals(), List.of(), fieldExtraction.classes()), List.of(), frontendResult.diagnostics());
             List<Diagnostic> diagnostics = result.diagnostics().stream()
@@ -101,13 +138,154 @@ public final class JavaParser implements LanguageParser {
         }
     }
 
+    /** Lowers the supported Scanner(System.in) primitive-token reads after javac validates Java syntax. */
+    private ScannerLowering lowerScannerInput(String source, JavaFrontendModel model) {
+        if (!model.imports().contains("java.util.Scanner")) return new ScannerLowering(source, List.of());
+        Pattern importPattern = Pattern.compile("\\bimport[ \\t]+java\\.util\\.Scanner[ \\t]*;");
+        Matcher importMatcher = importPattern.matcher(maskCommentsAndLiterals(source));
+        if (!importMatcher.find()) return scannerFailure(source, "CB-JAVA-SCANNER-UNSUPPORTED",
+                "Only a normal java.util.Scanner import is supported for console input.", source.indexOf("import"));
+        String scannerImportFree = blankSourceRange(source, importMatcher.start(), importMatcher.end());
+        Pattern scannerDeclaration = Pattern.compile("\\b(?:final\\s+)?Scanner\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*new\\s+Scanner\\s*\\(\\s*System\\s*\\.\\s*in\\s*\\)\\s*;");
+        Matcher scannerMatcher = scannerDeclaration.matcher(maskCommentsAndLiterals(scannerImportFree));
+        List<String> scannerNames = new java.util.ArrayList<>();
+        List<TextEdit> declarationEdits = new java.util.ArrayList<>();
+        while (scannerMatcher.find()) {
+            scannerNames.add(scannerMatcher.group(1));
+            declarationEdits.add(new TextEdit(scannerMatcher.start(), scannerMatcher.end(),
+                    blankSourceRange(scannerImportFree, scannerMatcher.start(), scannerMatcher.end())
+                            .substring(scannerMatcher.start(), scannerMatcher.end())));
+        }
+        if (scannerNames.isEmpty()) {
+            if (!Pattern.compile("\\bScanner\\b").matcher(maskCommentsAndLiterals(scannerImportFree)).find())
+                return new ScannerLowering(scannerImportFree, List.of());
+            return scannerFailure(source, "CB-JAVA-SCANNER-UNSUPPORTED",
+                    "Supported Scanner input must be initialized with new Scanner(System.in).", Math.max(0, source.indexOf("Scanner")));
+        }
+        String scannerAlternation = scannerNames.stream().map(Pattern::quote)
+                .collect(java.util.stream.Collectors.joining("|", "(?:", ")"));
+        String rewritten = applyTextEdits(scannerImportFree, declarationEdits);
+        Pattern primitiveRead = Pattern.compile("\\b(int|long|float|double|String)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*"
+                + scannerAlternation + "\\s*\\.\\s*next(Int|Long|Float|Double|Line|)?\\s*\\(\\s*\\)\\s*;");
+        Matcher readMatcher = primitiveRead.matcher(maskCommentsAndLiterals(rewritten));
+        List<TextEdit> readEdits = new java.util.ArrayList<>();
+        int readCount = 0;
+        while (readMatcher.find()) {
+            readCount++;
+            String type = readMatcher.group(1), name = readMatcher.group(2), method = readMatcher.group(3);
+            String methodType = method == null || method.isEmpty() || method.equals("Line") ? "String" : switch (method) { case "Int" -> "int"; case "Long" -> "long"; case "Float" -> "float"; default -> "double"; };
+            if (!type.equals(methodType))
+                return scannerFailure(source, "CB-JAVA-SCANNER-UNSUPPORTED",
+                        "Scanner read methods must match the declared String or numeric local type.", readMatcher.start());
+            String markerType = method != null && method.equals("Line") ? "line" : type.equals("String") ? "string" : type;
+            readEdits.add(new TextEdit(readMatcher.start(), readMatcher.end(), type + " " + name
+                    + "; __codebridge_read_" + markerType + "(" + name + ");"));
+        }
+        rewritten = applyTextEdits(rewritten, readEdits);
+        Pattern close = Pattern.compile("\\b" + scannerAlternation + "\\s*\\.\\s*close\\s*\\(\\s*\\)\\s*;");
+        Matcher closeMatcher = close.matcher(maskCommentsAndLiterals(rewritten));
+        List<TextEdit> closeEdits = new java.util.ArrayList<>();
+        while (closeMatcher.find()) closeEdits.add(new TextEdit(closeMatcher.start(), closeMatcher.end(),
+                blankSourceRange(rewritten, closeMatcher.start(), closeMatcher.end()).substring(closeMatcher.start(), closeMatcher.end())));
+        rewritten = applyTextEdits(rewritten, closeEdits);
+        String remainingSyntax = maskCommentsAndLiterals(rewritten);
+        if (Pattern.compile("\\bScanner\\b|\\b(?:" + scannerAlternation.substring(3, scannerAlternation.length() - 1) + ")\\b").matcher(remainingSyntax).find())
+            return scannerFailure(source, "CB-JAVA-SCANNER-UNSUPPORTED",
+                    "Supported Scanner methods are matching nextInt/nextLong/nextFloat/nextDouble for primitive locals, next()/nextLine() for String locals, and standalone close(). Other Scanner methods need an explicit mapping.",
+                    source.indexOf(scannerNames.getFirst()));
+        if (readCount == 0) return scannerFailure(source, "CB-JAVA-SCANNER-UNSUPPORTED",
+                "The supported Scanner subset requires at least one supported token or line read.",
+                source.indexOf("Scanner"));
+        return new ScannerLowering(rewritten, List.of());
+    }
+
+    private ScannerLowering scannerFailure(String source, String code, String message, int offset) {
+        return new ScannerLowering(source, List.of(Diagnostic.at(Severity.ERROR, code, message,
+                location(source, Math.max(0, offset)))));
+    }
+
+    /** Lowers the safe stack-object form; the Java compiler frontend has already validated the source. */
+    private String normalizeSimpleObjectDeclarations(String source, String className) {
+        Pattern declaration = Pattern.compile("\\b" + Pattern.quote(className)
+                + "\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*new\\s+" + Pattern.quote(className)
+                + "\\s*\\(\\s*\\)\\s*;");
+        Matcher matcher = declaration.matcher(maskCommentsAndLiterals(source));
+        char[] rewritten = source.toCharArray();
+        while (matcher.find()) {
+            String replacement = className + " " + matcher.group(1) + ";";
+            int offset = matcher.start();
+            for (int i = matcher.start(); i < matcher.end(); i++)
+                if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
+            for (int i = 0; i < replacement.length(); i++) rewritten[offset + i] = replacement.charAt(i);
+        }
+        return new String(rewritten);
+    }
+
+    private java.util.Set<String> simpleObjectNames(String source, String className) {
+        Pattern declaration = Pattern.compile("\\b" + Pattern.quote(className)
+                + "\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*new\\s+" + Pattern.quote(className)
+                + "\\s*\\(\\s*\\)\\s*;");
+        Matcher matcher = declaration.matcher(maskCommentsAndLiterals(source));
+        java.util.Set<String> names = new java.util.LinkedHashSet<>();
+        while (matcher.find()) names.add(matcher.group(1));
+        return java.util.Set.copyOf(names);
+    }
+
+    private String blankSourceRange(String source, int start, int end) {
+        char[] rewritten = source.toCharArray();
+        for (int i = Math.max(0, start); i < Math.min(end, rewritten.length); i++)
+            if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
+        return new String(rewritten);
+    }
+
+    private String applyTextEdits(String source, List<TextEdit> edits) {
+        if (edits.isEmpty()) return source;
+        StringBuilder result = new StringBuilder(source.length());
+        int cursor = 0;
+        for (TextEdit edit : edits.stream().sorted(java.util.Comparator.comparingInt(TextEdit::start)).toList()) {
+            result.append(source, cursor, edit.start()).append(edit.replacement());
+            cursor = edit.end();
+        }
+        return result.append(source, cursor, source.length()).toString();
+    }
+
+    private record ScannerLowering(String source, List<Diagnostic> diagnostics) { }
+    private record TextEdit(int start, int end, String replacement) { }
+
     private FieldExtraction extractPrimitiveStaticFields(String source, JavaFrontendModel model) {
         if (model.types().isEmpty() || !model.types().getFirst().kind().equals("CLASS"))
             return new FieldExtraction(source, List.of(), List.of(), List.of());
         List<com.tascode.codebridge.ir.GlobalVariableDeclaration> globals = new java.util.ArrayList<>();
         List<com.tascode.codebridge.ir.FieldDeclaration> instanceFields = new java.util.ArrayList<>();
+        List<com.tascode.codebridge.ir.ConstructorDeclaration> constructors = new java.util.ArrayList<>();
+        List<JavaFrontendModel.MemberModel> instanceMethods = model.types().getFirst().members().stream()
+                .filter(member -> member.kind().equals("METHOD") && !member.name().equals("<init>")
+                        && !member.modifiers().contains("static"))
+                .toList();
         char[] rewritten = source.toCharArray();
         for (JavaFrontendModel.MemberModel member : model.types().getFirst().members()) {
+            if (member.kind().equals("METHOD") && member.name().equals("<init>")) {
+                if (!member.modifiers().contains("public") && !member.modifiers().contains("private")
+                        && !member.modifiers().contains("protected")) return new FieldExtraction(source, List.of(), List.of(), List.of(), List.of(Diagnostic.at(
+                        Severity.ERROR, "CB-JAVA-ACCESS-UNSUPPORTED",
+                        "Package-private constructors have no direct C++ access equivalent; declare the constructor public, protected, or private.", member.sourceSpan())));
+                if (!member.parameterTypes().isEmpty() || !member.hasBody()) return new FieldExtraction(source, List.of(), List.of(), List.of(), List.of(Diagnostic.at(
+                        Severity.ERROR, "CB-JAVA-CONSTRUCTOR-UNSUPPORTED",
+                        "Only explicit no-argument constructors with an empty body are currently supported.", member.sourceSpan())));
+                String constructorSource = sourceSlice(source, member.sourceSpan());
+                int openBody = constructorSource.indexOf('{');
+                int closeBody = constructorSource.lastIndexOf('}');
+                if (openBody < 0 || closeBody <= openBody || !isTrivia(constructorSource.substring(openBody + 1, closeBody)))
+                    return new FieldExtraction(source, List.of(), List.of(), List.of(), List.of(Diagnostic.at(
+                            Severity.ERROR, "CB-JAVA-CONSTRUCTOR-UNSUPPORTED",
+                            "Constructor bodies with initialization logic are not yet supported; keep the constructor body empty.", member.sourceSpan())));
+                constructors.add(new com.tascode.codebridge.ir.ConstructorDeclaration(1, member.sourceSpan(), model.types().getFirst().name(),
+                        List.of(), List.of(), member.modifiers(), new com.tascode.codebridge.ir.BlockStatement(1, member.sourceSpan(), List.of())));
+                int start = offsetAt(source, member.sourceSpan().startLine(), member.sourceSpan().startColumn());
+                int end = Math.min(source.length(), offsetAt(source, member.sourceSpan().endLine(), member.sourceSpan().endColumn()) + 1);
+                for (int i = start; i < end; i++) if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
+                continue;
+            }
             if (!member.kind().equals("FIELD")) continue;
             if (member.type().isEmpty()) continue;
             com.tascode.codebridge.ir.TypeReference type = member.type().orElseThrow();
@@ -150,7 +328,7 @@ public final class JavaParser implements LanguageParser {
             for (int i = start; i < end; i++) if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
         }
         List<com.tascode.codebridge.ir.ClassDeclaration> classes = List.of();
-        if (!instanceFields.isEmpty()) {
+        if (!instanceFields.isEmpty() || !instanceMethods.isEmpty() || !constructors.isEmpty()) {
             JavaFrontendModel.TypeModel type = model.types().getFirst();
             if (!type.modifiers().contains("public")) return new FieldExtraction(source, List.of(), List.of(), List.of(Diagnostic.at(
                     Severity.ERROR, "CB-JAVA-PACKAGE-ACCESS-UNSUPPORTED",
@@ -158,10 +336,92 @@ public final class JavaParser implements LanguageParser {
             String visibility = type.modifiers().contains("public") ? "public" : type.modifiers().contains("private") ? "private" : "";
             classes = List.of(new com.tascode.codebridge.ir.ClassDeclaration(1, SourceSpan.point(1, 1), type.name(),
                     com.tascode.codebridge.ir.ClassDeclaration.Kind.CLASS, type.modifiers(), visibility, List.of(), Optional.empty(),
-                    List.of(), instanceFields, List.of(), List.of(), List.of()));
+                    List.of(), instanceFields, constructors, List.of(), List.of()));
         }
-        return new FieldExtraction(new String(rewritten), globals, classes, List.of());
+        return new FieldExtraction(new String(rewritten), globals, classes, instanceMethods, List.of());
     }
+
+    private LoweredJavaProgram attachInstanceMethods(com.tascode.codebridge.ir.Program program,
+                                                    FieldExtraction extraction, String source) {
+        if (extraction.instanceMethods().isEmpty()) {
+            return new LoweredJavaProgram(new com.tascode.codebridge.ir.Program(program.irVersion(), program.sourceSpan(),
+                    program.functions(), program.includes(), extraction.globals(), program.enums(), extraction.classes()), List.of());
+        }
+        List<com.tascode.codebridge.ir.FunctionDeclaration> freeFunctions = new java.util.ArrayList<>(program.functions());
+        List<com.tascode.codebridge.ir.MethodDeclaration> methods = new java.util.ArrayList<>();
+        List<Diagnostic> diagnostics = new java.util.ArrayList<>();
+        for (JavaFrontendModel.MemberModel member : extraction.instanceMethods()) {
+            String memberSource = sourceSlice(source, member.sourceSpan());
+            String memberSyntax = maskCommentsAndLiterals(memberSource);
+            if (Pattern.compile("\\bString\\b|\\bSystem\\s*\\.|\\b[A-Za-z_$][\\w$]*\\s*\\.\\s*[A-Za-z_$][\\w$]*")
+                    .matcher(memberSyntax).find()) {
+                diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-JAVA-INSTANCE-MEMBER-ACCESS-UNSUPPORTED",
+                        "Instance methods currently support primitive state and unqualified same-class calls only; Java library calls and qualified member access need explicit mappings.", member.sourceSpan()));
+                continue;
+            }
+            if (!member.hasBody()) {
+                diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-JAVA-ABSTRACT-METHOD-UNSUPPORTED",
+                        "Abstract or bodyless instance methods cannot be emitted as concrete C++ methods.", member.sourceSpan()));
+                continue;
+            }
+            if (member.type().isEmpty() || !supportedInstanceValueType(member.type().orElseThrow())
+                    || member.parameterTypes().stream().anyMatch(type -> !supportedInstanceValueType(type))) {
+                diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-JAVA-INSTANCE-METHOD-TYPE-UNSUPPORTED",
+                        "Instance methods currently support primitive return and parameter types only.", member.sourceSpan()));
+                continue;
+            }
+            int match = -1;
+            for (int i = 0; i < freeFunctions.size(); i++) {
+                var function = freeFunctions.get(i);
+                if (matchesJavaSignature(function, member)) {
+                    match = i;
+                    break;
+                }
+            }
+            if (match < 0) {
+                diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-JAVA-INSTANCE-METHOD-LOWERING",
+                        "The instance method body could not be lowered by the supported statement parser.", member.sourceSpan()));
+                continue;
+            }
+            var function = freeFunctions.remove(match);
+            methods.add(new com.tascode.codebridge.ir.MethodDeclaration(1, member.sourceSpan(), member.name(),
+                    new com.tascode.codebridge.ir.TypeReference(1, member.sourceSpan(), function.returnType()),
+                    function.parameters(), List.of(), List.of(), member.modifiers(), Optional.of(function.body())));
+        }
+        if (!diagnostics.isEmpty()) return new LoweredJavaProgram(program, diagnostics);
+        var classDecl = extraction.classes().getFirst();
+        var updatedClass = new com.tascode.codebridge.ir.ClassDeclaration(classDecl.irVersion(), classDecl.sourceSpan(),
+                classDecl.name(), classDecl.kind(), classDecl.modifiers(), classDecl.visibility(), classDecl.typeParameters(),
+                classDecl.superclass(), classDecl.interfaces(), classDecl.fields(), classDecl.constructors(), methods, classDecl.nestedTypes());
+        return new LoweredJavaProgram(new com.tascode.codebridge.ir.Program(program.irVersion(), program.sourceSpan(), freeFunctions,
+                program.includes(), extraction.globals(), program.enums(), List.of(updatedClass)), List.of());
+    }
+
+    private boolean matchesJavaSignature(com.tascode.codebridge.ir.FunctionDeclaration function,
+                                         JavaFrontendModel.MemberModel member) {
+        if (!function.name().equals(member.name()) || function.parameters().size() != member.parameterTypes().size()) return false;
+        for (int i = 0; i < function.parameters().size(); i++) {
+            var sourceType = member.parameterTypes().get(i);
+            if (sourceType.arrayDimensions() != 0 || !sourceType.typeArguments().isEmpty()) return false;
+            String expected = sourceType.name().equals("boolean") ? "bool" : sourceType.name();
+            if (!function.parameters().get(i).type().equals(expected)) return false;
+        }
+        String expectedReturn = member.type().map(type -> type.name().equals("boolean") ? "bool" : type.name()).orElse("");
+        return function.returnType().equals(expectedReturn);
+    }
+
+    private boolean supportedInstanceValueType(com.tascode.codebridge.ir.TypeReference type) {
+        return type.arrayDimensions() == 0 && type.typeArguments().isEmpty()
+                && List.of("byte", "short", "int", "long", "float", "double", "char", "boolean", "void", "bool").contains(type.name());
+    }
+
+    private String sourceSlice(String source, SourceSpan span) {
+        int start = offsetAt(source, span.startLine(), span.startColumn());
+        int end = Math.min(source.length(), offsetAt(source, span.endLine(), span.endColumn()) + 1);
+        return source.substring(Math.min(start, end), end);
+    }
+
+    private record LoweredJavaProgram(com.tascode.codebridge.ir.Program program, List<Diagnostic> diagnostics) { }
 
     private com.tascode.codebridge.ir.Expression parseStaticFieldLiteral(String type, String value, SourceSpan span) {
         ParseResult parsed = functionParser.parse(normalizeBooleanTypes(type + " __codebridge_field() { return " + value + "; }"));
@@ -198,7 +458,13 @@ public final class JavaParser implements LanguageParser {
 
     private record FieldExtraction(String source, List<com.tascode.codebridge.ir.GlobalVariableDeclaration> globals,
                                    List<com.tascode.codebridge.ir.ClassDeclaration> classes,
-                                   List<Diagnostic> diagnostics) { }
+                                   List<JavaFrontendModel.MemberModel> instanceMethods,
+                                   List<Diagnostic> diagnostics) {
+        private FieldExtraction(String source, List<com.tascode.codebridge.ir.GlobalVariableDeclaration> globals,
+                                List<com.tascode.codebridge.ir.ClassDeclaration> classes, List<Diagnostic> diagnostics) {
+            this(source, globals, classes, List.of(), diagnostics);
+        }
+    }
     private boolean hasNonNullStringArrayInitializer(String source, int afterType) {
         Matcher declaration = Pattern.compile("^\\s*(?:[A-Za-z_$][\\w$]*\\s*=\\s*(?:new\\s+(?:java\\.lang\\.)?String\\s*\\[\\s*\\]\\s*)?)?\\{([^{}]*)\\}")
                 .matcher(source.substring(afterType));
@@ -354,14 +620,8 @@ public final class JavaParser implements LanguageParser {
                 while (nameStart > memberStart && Character.isJavaIdentifierPart(source.charAt(nameStart - 1))) nameStart--;
                 if (nameStart < nameEnd) {
                     String signature = source.substring(memberStart, nameStart);
-                    if (signature.isBlank() || signature.matches("\\s*public\\s*")) {
-                        throw new ParseFailure("CB-JAVA-CONSTRUCTOR-UNSUPPORTED",
-                                "Java constructors are unsupported because object initialization is not represented in the shared IR.",
-                                location(source, nameStart));
-                    }
-                    if (!signature.isBlank() && !Pattern.compile("\\bstatic\\b").matcher(signature).find()) {
-                        throw new ParseFailure("Only static Java methods are supported; instance method '" + source.substring(nameStart, nameEnd) + "' cannot be flattened safely.", location(source, nameStart));
-                    }
+                    if (signature.isBlank() || signature.matches("\\s*public\\s*")) continue;
+                    // Instance methods remain in the source long enough to lower their bodies into class IR.
                 }
             }
             if (depth == 1 && c == '{') {

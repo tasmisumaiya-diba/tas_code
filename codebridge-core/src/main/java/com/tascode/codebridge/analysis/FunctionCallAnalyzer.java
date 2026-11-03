@@ -12,7 +12,20 @@ public final class FunctionCallAnalyzer {
 
     public List<Diagnostic> analyze(Program program, Language sourceLanguage, Language targetLanguage) {
         Map<String, FunctionDeclaration> functions = new HashMap<>();
-        for (FunctionDeclaration function : program.functions()) functions.putIfAbsent(function.name(), function);
+        Map<String, Integer> overloadOrdinals = new HashMap<>();
+        for (FunctionDeclaration function : program.functions()) {
+            int ordinal = overloadOrdinals.merge(function.name(), 1, Integer::sum);
+            String key = ordinal == 1 ? function.name() : function.name() + "#codebridge-overload-" + ordinal;
+            functions.put(key, function);
+        }
+        for (ClassDeclaration type : program.classes()) for (MethodDeclaration method : type.methods()) {
+            method.body().ifPresent(body -> {
+                FunctionDeclaration lowered = new FunctionDeclaration(method.irVersion(), method.sourceSpan(),
+                        method.returnType().name(), type.name() + "." + method.name(), method.parameters(), body);
+                int ordinal = overloadOrdinals.merge(lowered.name(), 1, Integer::sum);
+                functions.put(ordinal == 1 ? lowered.name() : lowered.name() + "#codebridge-overload-" + ordinal, lowered);
+            });
+        }
         List<Diagnostic> diagnostics = new ArrayList<>();
         for (FunctionDeclaration function : program.functions()) {
             Map<String, String> locals = new HashMap<>();
@@ -22,6 +35,15 @@ public final class FunctionCallAnalyzer {
             visitBlock(function.body(), functions, locals, sourceLanguage, targetLanguage, diagnostics);
             checkCallReturns(function.body(), normalize(function.returnType()), functions, locals, sourceLanguage, targetLanguage, diagnostics);
         }
+        for (ClassDeclaration type : program.classes()) for (MethodDeclaration method : type.methods()) method.body().ifPresent(body -> {
+            Map<String, String> locals = new HashMap<>();
+            locals.put("__codebridge_this_class", type.name());
+            type.fields().forEach(field -> locals.put(field.name(), normalize(field.type().name())));
+            method.parameters().forEach(parameter -> locals.put(parameter.name(), normalize(parameter.type())));
+            collectLocals(body, locals);
+            visitBlock(body, functions, locals, sourceLanguage, targetLanguage, diagnostics);
+            checkCallReturns(body, normalize(method.returnType().name()), functions, locals, sourceLanguage, targetLanguage, diagnostics);
+        });
         return List.copyOf(diagnostics);
     }
 
@@ -29,8 +51,10 @@ public final class FunctionCallAnalyzer {
                                   Map<String, String> locals, Language source, Language target, List<Diagnostic> diagnostics) {
         if (statement instanceof ReturnStatement returned) {
             returned.value().filter(CallExpression.class::isInstance).map(CallExpression.class::cast)
-                    .filter(call -> functions.containsKey(call.callee())).ifPresent(call -> {
-                        String actual = normalize(functions.get(call.callee()).returnType());
+                    .ifPresent(call -> {
+                        FunctionDeclaration resolved = resolveFunction(call, functions, locals, source, target);
+                        if (resolved == null) return;
+                        String actual = normalize(resolved.returnType());
                         if (!compatible(expected, actual, source, target)) {
                             error("CB-TYPE-CALL-RETURN", "Function '" + call.callee() + "' returns '" + actual
                                     + "', which is incompatible with the enclosing return type '" + expected + "'.", call, diagnostics);
@@ -177,7 +201,34 @@ public final class FunctionCallAnalyzer {
     }
     private void visitExpression(Expression expression, Map<String, FunctionDeclaration> functions, Map<String, String> locals,
                                  Language source, Language target, List<Diagnostic> diagnostics) {
+        if (source == Language.JAVA && target == Language.CPP
+                && typeOf(expression, locals, functions).equals("char")) {
+            runtimeWarning("CB-JAVA-CPP-CHAR-WIDTH", "Java char is a 16-bit UTF-16 code unit; C++ char is a byte. This conversion is safe only for values representable in the target execution character set.", expression.sourceSpan(), diagnostics);
+        }
         if (expression instanceof CallExpression call) {
+            if (source == Language.JAVA && (target == Language.C || target == Language.CPP)
+                    && Set.of("__codebridge_read_int", "__codebridge_read_long", "__codebridge_read_float", "__codebridge_read_double", "__codebridge_read_string", "__codebridge_read_line").contains(call.callee())) {
+                String readType = switch (call.callee()) {
+                    case "__codebridge_read_long" -> "long";
+                    case "__codebridge_read_float" -> "float";
+                    case "__codebridge_read_double" -> "double";
+                    case "__codebridge_read_string", "__codebridge_read_line" -> "string";
+                    default -> "int";
+                };
+                if (call.arguments().size() != 1 || !(call.arguments().getFirst() instanceof NameExpression targetName)) {
+                    error("CB-JAVA-SCANNER-LOWERING", "A lowered Scanner numeric read must target one local variable.", call, diagnostics);
+                } else if (!locals.getOrDefault(targetName.name(), "unknown").equals(readType)) {
+                    errorAt("CB-JAVA-SCANNER-LOWERING", "The Scanner numeric read must match its target " + readType + " type.",
+                            targetName.sourceSpan(), diagnostics);
+                } else if (target == Language.C && readType.equals("long")) {
+                    errorAt("CB-JAVA-SCANNER-UNSUPPORTED", "Java long input is not mapped to C because C long width varies by platform.",
+                            targetName.sourceSpan(), diagnostics);
+                } else if (target == Language.C && readType.equals("string")) {
+                    errorAt("CB-JAVA-SCANNER-UNSUPPORTED", "Java String token input requires std::string and is available only for C++.",
+                            targetName.sourceSpan(), diagnostics);
+                }
+                return;
+            }
             if (source == Language.CPP && call.callee().equals("__codebridge_endl")) return;
             if (source == Language.CPP && call.callee().equals("__codebridge_cin")) {
                 if (target != Language.JAVA) error("CB-INPUT-CIN-TARGET", "C++ stream input converts only to Java in the current subset.", call, diagnostics);
@@ -187,7 +238,11 @@ public final class FunctionCallAnalyzer {
                 error("CB-IO-COUT-TARGET", "C++ stream output cannot be converted to C by the supported subset.", call, diagnostics);
                 return;
             }
-            FunctionDeclaration function = functions.get(call.callee());
+            String lookupName = functionLookupName(call.callee(), locals, functions);
+            List<FunctionDeclaration> namedFunctions = functions.values().stream()
+                    .filter(candidate -> candidate.name().equals(lookupName)).toList();
+            FunctionDeclaration function = resolveFunction(call, functions, locals, source, target);
+            if (function == null && namedFunctions.size() == 1) function = namedFunctions.getFirst();
             if (function != null) {
                 if (function.parameters().size() != call.arguments().size()) {
                     error("CB-CALL-ARG-COUNT", "Function '" + call.callee() + "' expects " + function.parameters().size()
@@ -202,6 +257,9 @@ public final class FunctionCallAnalyzer {
                         }
                     }
                 }
+            } else if (!namedFunctions.isEmpty()) {
+                error("CB-CALL-OVERLOAD-NO-MATCH", "No overload of function '" + call.callee()
+                        + "' accepts the supplied argument types.", call, diagnostics);
             } else if (source == Language.JAVA && isStringEquals(call, locals)) {
                 if (call.arguments().size() != 1) error("CB-STRING-EQUALS-ARITY", "String.equals requires exactly one argument.", call, diagnostics);
                 else if (!compatible("string", typeOf(call.arguments().getFirst(), locals, functions), source, target)) errorAt("CB-STRING-EQUALS-TYPE", "String.equals requires a string argument.", call.arguments().getFirst().sourceSpan(), diagnostics);
@@ -210,11 +268,23 @@ public final class FunctionCallAnalyzer {
                 else if (!compatible("string", typeOf(call.arguments().getFirst(), locals, functions), source, target)) errorAt("CB-STRING-METHOD-TYPE", "String methods require a String argument.", call.arguments().getFirst().sourceSpan(), diagnostics);
             } else if (source == Language.JAVA && target == Language.CPP && isStringZeroArgumentMethod(call, locals)) {
                 if (!call.arguments().isEmpty()) error("CB-STRING-METHOD-ARITY", "String.length() and String.isEmpty() take no arguments.", call, diagnostics);
+            } else if (source == Language.JAVA && target == Language.CPP && isMappedMathMethod(call)) {
+                int expected = call.callee().endsWith(".pow") ? 2 : 1;
+                if (call.arguments().size() != expected) error("CB-JAVA-MATH-ARITY", "Math method " + call.callee() + " expects " + expected + " numeric argument(s).", call, diagnostics);
+                runtimeWarning("CB-JAVA-CPP-MATH-ROUNDING", "Java Math and the C++ standard library can differ at floating-point rounding boundaries; verify results that depend on exact last-bit values.", call.sourceSpan(), diagnostics);
             } else if (!isSupportedOutputCall(call.callee(), source)) {
                 error("CB-CALL-UNRESOLVED", "Function '" + call.callee() + "' is not declared or supported.", call, diagnostics);
             } else checkOutputCall(call, source, target, locals, functions, diagnostics);
             call.arguments().forEach(argument -> visitExpression(argument, functions, locals, source, target, diagnostics));
         } else if (expression instanceof BinaryExpression binary) {
+            if (source == Language.JAVA && target == Language.CPP
+                    && Set.of("+", "-", "*", "/", "%", "<<").contains(binary.operator())
+                    && javaIntegral(typeOf(binary.left(), locals, functions))
+                    && javaIntegral(typeOf(binary.right(), locals, functions))) {
+                diagnostics.add(Diagnostic.at(Severity.WARNING, "CB-JAVA-CPP-INTEGER-OVERFLOW-POSSIBLE",
+                        "Java integer arithmetic wraps on overflow; signed C++ overflow is undefined. Keep this operation within the Java type's range.",
+                        binary.sourceSpan()));
+            }
             visitExpression(binary.left(), functions, locals, source, target, diagnostics);
             visitExpression(binary.right(), functions, locals, source, target, diagnostics);
         } else if (expression instanceof UnaryExpression unary) visitExpression(unary.operand(), functions, locals, source, target, diagnostics);
@@ -227,6 +297,11 @@ public final class FunctionCallAnalyzer {
             visitExpression(access.array(), functions, locals, source, target, diagnostics);
             visitExpression(access.index(), functions, locals, source, target, diagnostics);
         }
+    }
+
+    private boolean isMappedMathMethod(CallExpression call) {
+        if (!call.callee().startsWith("Math.")) return false;
+        return Set.of("Math.sqrt", "Math.pow", "Math.floor", "Math.ceil").contains(call.callee());
     }
 
     private boolean isStringOneArgumentMethod(CallExpression call, Map<String, String> locals) {
@@ -265,9 +340,12 @@ public final class FunctionCallAnalyzer {
                     errorAt("CB-IO-OUTPUT-TYPE", "String concatenation with non-string values is not supported for native print.",
                             call.arguments().getFirst().sourceSpan(), diagnostics);
                     return;
-                }                boolean supported = Set.of("string", "byte", "int", "short", "char").contains(actual);
+                }                Set<String> supportedTypes = target == Language.CPP
+                        ? Set.of("string", "byte", "int", "short", "char", "long", "float", "double", "bool")
+                        : Set.of("string", "byte", "int", "short", "char");
+                boolean supported = supportedTypes.contains(actual);
                 if (!supported) errorAt("CB-IO-OUTPUT-TYPE",
-                        "Java print supports strings, integers, and characters only.",
+                        "Java print supports strings, primitive numbers, booleans, and characters.",
                         call.arguments().getFirst().sourceSpan(), diagnostics);
             }
             return;
@@ -282,8 +360,11 @@ public final class FunctionCallAnalyzer {
                     errorAt("CB-IO-OUTPUT-TYPE", "String concatenation with non-string values is not supported for native println.",
                             call.arguments().getFirst().sourceSpan(), diagnostics);
                     return;
-                }                if (!Set.of("string", "byte", "int", "short", "char").contains(actual)) {
-                    errorAt("CB-IO-OUTPUT-TYPE", "Cross-language println conversion supports strings, integers, and characters only.",
+                }                Set<String> supportedTypes = target == Language.CPP
+                        ? Set.of("string", "byte", "int", "short", "char", "long", "float", "double", "bool")
+                        : Set.of("string", "byte", "int", "short", "char");
+                if (!supportedTypes.contains(actual)) {
+                    errorAt("CB-IO-OUTPUT-TYPE", "Cross-language println conversion supports strings, primitive numbers, booleans, and characters.",
                             call.arguments().getFirst().sourceSpan(), diagnostics);
                 }
             }
@@ -389,8 +470,9 @@ boolean puts = call.callee().equals("puts");
             return Set.of("byte", "short", "char").contains(operand) ? "int" : operand;
         } else if (expression instanceof AssignmentExpression assignment) return typeOf(assignment.target(), locals, functions);
         else if (expression instanceof UpdateExpression update) return typeOf(update.target(), locals, functions);
-        else if (expression instanceof CallExpression call && functions.containsKey(call.callee())) {
-            return normalize(functions.get(call.callee()).returnType());
+        else if (expression instanceof CallExpression call) {
+            FunctionDeclaration resolved = resolveFunction(call, functions, locals, Language.CPP, Language.CPP);
+            if (resolved != null) return normalize(resolved.returnType());
         }
         return "unknown";
     }
@@ -398,6 +480,51 @@ boolean puts = call.callee().equals("puts");
         List<String> order = List.of("byte", "short", "char", "int", "long", "float", "double");
         String promoted = order.get(Math.max(order.indexOf(first), order.indexOf(second)));
         return Set.of("byte", "short", "char").contains(promoted) ? "int" : promoted;
+    }
+    private FunctionDeclaration resolveFunction(CallExpression call, Map<String, FunctionDeclaration> functions,
+                                                Map<String, String> locals, Language source, Language target) {
+        String lookupName = functionLookupName(call.callee(), locals, functions);
+        FunctionDeclaration best = null;
+        int bestScore = Integer.MIN_VALUE;
+        boolean tied = false;
+        for (FunctionDeclaration candidate : functions.values()) {
+            if (!candidate.name().equals(lookupName) || candidate.parameters().size() != call.arguments().size()) continue;
+            int score = 0;
+            boolean viable = true;
+            for (int i = 0; i < call.arguments().size(); i++) {
+                String expected = normalize(candidate.parameters().get(i).type());
+                String actual = typeOf(call.arguments().get(i), locals, functions);
+                if (!compatible(expected, actual, source, target)) { viable = false; break; }
+                score += expected.equals(actual) ? 2 : actual.equals("unknown") ? 0 : 1;
+            }
+            if (!viable) continue;
+            if (score > bestScore) { best = candidate; bestScore = score; tied = false; }
+            else if (score == bestScore) tied = true;
+        }
+        return tied ? null : best;
+    }
+    private String functionLookupName(String callee, Map<String, String> locals,
+                                      Map<String, FunctionDeclaration> functions) {
+        int separator = callee.indexOf('.');
+        if (separator > 0) {
+            String receiverType = locals.get(callee.substring(0, separator));
+            if (receiverType != null) {
+                String qualified = receiverType + callee.substring(separator);
+                if (functions.values().stream().anyMatch(candidate -> candidate.name().equals(qualified))) return qualified;
+            }
+        }
+        String currentClass = locals.get("__codebridge_this_class");
+        if (currentClass != null) {
+            String qualified = currentClass + "." + callee;
+            if (functions.values().stream().anyMatch(candidate -> candidate.name().equals(qualified))) return qualified;
+        }
+        return callee;
+    }
+    private boolean javaIntegral(String type) { return Set.of("byte", "short", "char", "int", "long").contains(type); }
+    private void runtimeWarning(String code, String message, com.tascode.codebridge.diagnostic.SourceSpan span,
+                                List<Diagnostic> diagnostics) {
+        if (diagnostics.stream().noneMatch(d -> d.code().equals(code) && d.location().filter(span::equals).isPresent()))
+            diagnostics.add(Diagnostic.at(Severity.WARNING, code, message, span));
     }
     private boolean javaWidening(String actual, String expected) {
         return switch (actual) {

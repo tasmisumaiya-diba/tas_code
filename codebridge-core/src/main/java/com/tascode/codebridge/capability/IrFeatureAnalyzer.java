@@ -34,10 +34,14 @@ public final class IrFeatureAnalyzer {
             type.nestedTypes().forEach(nested -> visit(nested, features));
         } else if (node instanceof FieldDeclaration field) {
             features.add("fields");
+            if (stringType(field.type().name())) features.add("strings");
+            if (byteType(field.type().name())) features.add("byte");
             if (!field.type().typeArguments().isEmpty()) features.add("generics");
             field.initializer().ifPresent(value -> visit(value, features));
         } else if (node instanceof MethodDeclaration method) {
             features.add("methods");
+            if (stringType(method.returnType().name())) features.add("strings");
+            if (byteType(method.returnType().name())) features.add("byte");
             if (!method.typeParameters().isEmpty()) features.add("generics");
             method.parameters().forEach(parameter -> visit(parameter, features));
             method.body().ifPresent(body -> visit(body, features));

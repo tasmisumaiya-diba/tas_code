@@ -18,6 +18,10 @@ public final class CppGenerator implements LanguageGenerator {
         GenerationResult generated = delegate.generate(root);
         if (!generated.successful() || !(root instanceof Program program) || program.functions().isEmpty()) return generated;
         String source = generated.source();
+        if (source.contains("__codebridge_java_string_length")) source = "#include <cstddef>\n" + source;
+        if (source.contains("std::sqrt") || source.contains("std::pow") || source.contains("std::floor")
+                || source.contains("std::ceil")) source = "#include <cmath>\n" + source;
+        if (source.contains("std::min") || source.contains("std::max")) source = "#include <algorithm>\n" + source;
         int insertion = 0;
         while (source.startsWith("#include ", insertion)) {
             int newline = source.indexOf('\n', insertion);
@@ -29,8 +33,12 @@ public final class CppGenerator implements LanguageGenerator {
         List<String> helpers = runtimeHelpers(program);
         for (String helper : helpers) output.append(helper).append('\n');
         if (!helpers.isEmpty()) output.append('\n');
-        for (FunctionDeclaration function : program.functions()) output.append(prototype(function)).append('\n');
-        output.append('\n');
+        boolean hasForwardDeclarations = program.functions().stream().anyMatch(function -> !function.name().equals("main"));
+        for (FunctionDeclaration function : program.functions()) {
+            // main is the program entry point and cannot be called as an ordinary helper.
+            if (!function.name().equals("main")) output.append(prototype(function)).append('\n');
+        }
+        if (hasForwardDeclarations) output.append('\n');
         int body = insertion;
         if (body < source.length() && source.charAt(body) == '\n') body++;
         output.append(source.substring(body));
@@ -42,6 +50,7 @@ public final class CppGenerator implements LanguageGenerator {
         if (containsCall(program, "__codebridge_starts_with")) helpers.add("static bool __codebridge_starts_with(const std::string& value, const std::string& prefix) { return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0; }");
         if (containsCall(program, "__codebridge_ends_with")) helpers.add("static bool __codebridge_ends_with(const std::string& value, const std::string& suffix) { return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0; }");
         if (containsCall(program, "__codebridge_contains")) helpers.add("static bool __codebridge_contains(const std::string& value, const std::string& part) { return value.find(part) != std::string::npos; }");
+        if (containsCall(program, "__codebridge_java_string_length")) helpers.add("static std::size_t __codebridge_java_string_length(const std::string& value) { std::size_t units = 0; for (std::size_t i = 0; i < value.size();) { unsigned char lead = static_cast<unsigned char>(value[i]); if (lead < 0x80) { ++units; ++i; } else if ((lead & 0xE0) == 0xC0 && i + 1 < value.size()) { ++units; i += 2; } else if ((lead & 0xF0) == 0xE0 && i + 2 < value.size()) { ++units; i += 3; } else if ((lead & 0xF8) == 0xF0 && i + 3 < value.size()) { units += 2; i += 4; } else { ++units; ++i; } } return units; }");
         return helpers;
     }
 

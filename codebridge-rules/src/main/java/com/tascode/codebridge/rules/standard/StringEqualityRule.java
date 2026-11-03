@@ -81,7 +81,12 @@ public final class StringEqualityRule implements ConversionRule {
                 if (separator > 0) {
                     String receiver = c.callee().substring(0, separator);
                     String method = c.callee().substring(separator + 1);
-                    String mapping = JAVA_CPP_STRING_MAPPINGS.get(method + "/" + c.arguments().size());
+                    String owner = receiver.equals("Math") ? "Math" : "String";
+                    String mapping = JAVA_CPP_STRING_MAPPINGS.get(owner + "/" + method + "/" + c.arguments().size());
+                    if (receiver.equals("Math") && mapping != null) {
+                        return new CallExpression(c.irVersion(), c.sourceSpan(), mapping,
+                                c.arguments().stream().map(x -> rewriteExpression(x, types)).toList());
+                    }
                     if (mapping != null && types.getOrDefault(receiver, "unknown").equals("string")) {
                         if (mapping.equals("==") && c.arguments().size() == 1) {
                             Expression argument = rewriteExpression(c.arguments().getFirst(), types);
@@ -90,6 +95,9 @@ public final class StringEqualityRule implements ConversionRule {
                                         new NameExpression(c.irVersion(), c.sourceSpan(), receiver), argument);
                         } else if (Set.of("empty", "length").contains(mapping)) {
                             return new CallExpression(c.irVersion(), c.sourceSpan(), receiver + "." + mapping, List.of());
+                        } else if (mapping.startsWith("HELPER:") && c.arguments().isEmpty()) {
+                            return new CallExpression(c.irVersion(), c.sourceSpan(), mapping.substring("HELPER:".length()),
+                                    List.of(new NameExpression(c.irVersion(), c.sourceSpan(), receiver)));
                         } else if (mapping.equals("+") && c.arguments().size() == 1) {
                             Expression argument = rewriteExpression(c.arguments().getFirst(), types);
                             if (typeOf(argument, types).equals("string"))
@@ -128,10 +136,10 @@ public final class StringEqualityRule implements ConversionRule {
                 lineNumber++;
                 if (line.isBlank() || line.startsWith("#")) continue;
                 String[] fields = line.split("\\t", -1);
-                if (fields.length != 4 || !fields[0].equals("String") || fields[1].isBlank()
+                if (fields.length != 4 || !Set.of("String", "Math").contains(fields[0]) || fields[1].isBlank()
                         || !fields[2].matches("\\d+") || fields[3].isBlank())
                     throw new IllegalStateException("Invalid Java-to-C++ runtime mapping at line " + lineNumber);
-                if (mappings.putIfAbsent(fields[1] + "/" + fields[2], fields[3]) != null)
+                if (mappings.putIfAbsent(fields[0] + "/" + fields[1] + "/" + fields[2], fields[3]) != null)
                     throw new IllegalStateException("Duplicate Java-to-C++ runtime mapping at line " + lineNumber);
             }
         } catch (IOException exception) {

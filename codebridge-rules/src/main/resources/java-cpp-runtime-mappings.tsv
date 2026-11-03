@@ -1,9 +1,13 @@
-# Java String method mappings: owner	method	arity	C++ mapping
+# Java library method mappings: owner	method	arity	C++ mapping
 # These mappings apply to non-null Java String values represented by std::string.
 String	isEmpty	0	empty
 String	equals	1	==
-String	length	0	length
+String	length	0	HELPER:__codebridge_java_string_length
 String	startsWith	1	HELPER:__codebridge_starts_with
 String	endsWith	1	HELPER:__codebridge_ends_with
 String	contains	1	HELPER:__codebridge_contains
 String	concat	1	+
+Math	sqrt	1	std::sqrt
+Math	pow	2	std::pow
+Math	floor	1	std::floor
+Math	ceil	1	std::ceil

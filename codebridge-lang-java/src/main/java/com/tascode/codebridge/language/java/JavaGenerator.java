@@ -23,6 +23,51 @@ public final class JavaGenerator implements LanguageGenerator {
             global.initializer().ifPresent(value -> { out.append(" = "); expression(out, value); });
             out.append(";\n");
         }
+        for (ClassDeclaration type : program.classes()) {
+            if (type.name().equals("TasCodeGenerated")) return new GenerationResult(null, List.of(Diagnostic.at(
+                    Severity.ERROR, "CB-GEN-JAVA-NESTED-NAME-UNSUPPORTED",
+                    "The source class name conflicts with the generated Java wrapper name.", type.sourceSpan())));
+            if (!type.nestedTypes().isEmpty() || type.superclass().isPresent()
+                    || !type.interfaces().isEmpty() || !type.typeParameters().isEmpty()) {
+                return new GenerationResult(null, List.of(Diagnostic.at(Severity.ERROR, "CB-GEN-JAVA-CLASS-UNSUPPORTED",
+                        "The Java generator cannot yet preserve constructors, inheritance, nested classes, or generics.", type.sourceSpan())));
+            }
+            out.append("    public static class ").append(type.name()).append(" {\n");
+            for (FieldDeclaration field : type.fields()) {
+                out.append("        ").append(javaAccess(field.modifiers())).append(' ');
+                if (field.modifiers().contains("static")) out.append("static ");
+                if (field.modifiers().contains("final")) out.append("final ");
+                out.append(javaType(field.type().name())).append(' ').append(field.name());
+                field.initializer().ifPresent(value -> { out.append(" = "); expression(out, value); });
+                out.append(";\n");
+            }
+            for (ConstructorDeclaration constructor : type.constructors()) {
+                if (!constructor.parameters().isEmpty()) return new GenerationResult(null, List.of(Diagnostic.at(
+                        Severity.ERROR, "CB-GEN-JAVA-CONSTRUCTOR-UNSUPPORTED",
+                        "The Java generator currently supports only no-argument constructors.", constructor.sourceSpan())));
+                out.append("        ").append(javaAccess(constructor.modifiers())).append(' ')
+                        .append(type.name()).append("() ");
+                block(out, constructor.body(), 2, false);
+                out.append('\n');
+            }
+            for (MethodDeclaration method : type.methods()) {
+                if (method.body().isEmpty()) return new GenerationResult(null, List.of(Diagnostic.at(
+                        Severity.ERROR, "CB-GEN-JAVA-ABSTRACT-METHOD-UNSUPPORTED",
+                        "Abstract methods need an interface or abstract class model.", method.sourceSpan())));
+                out.append("        ").append(javaAccess(method.modifiers())).append(' ');
+                if (method.modifiers().contains("static")) out.append("static ");
+                out.append(javaType(method.returnType().name())).append(' ').append(method.name()).append('(');
+                for (int i = 0; i < method.parameters().size(); i++) {
+                    if (i > 0) out.append(", ");
+                    Parameter parameter = method.parameters().get(i);
+                    out.append(javaType(parameter.type())).append(' ').append(parameter.name());
+                }
+                out.append(") ");
+                block(out, method.body().orElseThrow(), 2, false);
+                out.append('\n');
+            }
+            out.append("    }\n\n");
+        }
         if (!program.globals().isEmpty()) out.append("\n");
         if (containsIntegerInput(program)) out.append("    private static final java.util.Scanner CODEBRIDGE_INPUT = new java.util.Scanner(System.in).useLocale(java.util.Locale.ROOT);\n");
         if (containsCharInput(program)) out.append("    private static char codeBridgeReadCharOr(char previous) { String next = CODEBRIDGE_INPUT.findWithinHorizon(\"(?s).\", 0); return next == null ? previous : next.charAt(0); }\n");
@@ -52,6 +97,12 @@ public final class JavaGenerator implements LanguageGenerator {
     private String javaType(String type) {
         if (type.endsWith("[]")) return javaType(type.substring(0, type.length() - 2)) + "[]";
         return switch (type) { case "bool", "_Bool" -> "boolean"; case "c-long" -> "long"; case "string", "String" -> "String"; default -> type; };
+    }
+
+    private String javaAccess(java.util.Set<String> modifiers) {
+        if (modifiers.contains("private")) return "private";
+        if (modifiers.contains("protected")) return "protected";
+        return "public";
     }
 
     private boolean isJavaEntryPoint(FunctionDeclaration function) {

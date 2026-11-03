@@ -75,6 +75,17 @@ class CodeBridgePipelineTest {
         if (javaValidation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE) assertTrue(javaValidation.successful(), () -> javaValidation.diagnostics().toString());
     }
 
+    @Test void javaInstanceMethodOverloadsKeepDistinctCppSignatures() throws Exception {
+        String source = "public class Adder { public int add(int left, int right) { return left + right; } "
+                + "public long add(long left, long right) { return left + right; } }";
+        var result = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(result.successful(), () -> result.diagnostics().toString());
+        String generated = result.output().orElseThrow();
+        assertTrue(generated.contains("int add(int left, int right)"), generated);
+        assertTrue(generated.contains("long long add(long long left, long long right)"), generated);
+        compileCpp(generated);
+    }
+
     @Test void javaByteNarrowingIsLimitedToInRangeIntegerConstantsAndCRejectsByte() {
         var inRange = convert(Language.JAVA, Language.CPP, "class B { public static byte value() { byte result = 127; return result; } }");
         assertTrue(inRange.successful(), () -> inRange.diagnostics().toString());
@@ -150,7 +161,8 @@ class CodeBridgePipelineTest {
             assertTrue(nativeResult.successful(), () -> target + ": " + nativeResult.diagnostics());
             String generated = nativeResult.output().orElseThrow();
             assertTrue(generated.contains("main("), generated);
-            assertTrue(generated.contains("printf("), generated);
+            if (target == Language.C) assertTrue(generated.contains("printf("), generated);
+            else assertTrue(generated.contains("std::cout"), generated);
             assertTrue(generated.contains("first + second"), generated);
             assertTrue(generated.contains("return 0;"), generated);
             var validator = new com.tascode.codebridge.validation.CompilerValidationService()
@@ -159,6 +171,33 @@ class CodeBridgePipelineTest {
                 assertTrue(validator.successful(), () -> target + ": " + validator.diagnostics());
             }
         }
+    }
+
+    @Test void cToCppUsesIdiomaticStreamOutputWithoutUnneededHeadersOrMainPrototype() {
+        var converted = convert(Language.C, Language.CPP,
+                "#include <stdio.h>\nint main() { int first = 2; int second = 3; printf(\"Sum = %d\", first + second); return 0; }");
+        assertTrue(converted.successful(), () -> converted.diagnostics().toString());
+        String cpp = converted.output().orElseThrow();
+        assertTrue(cpp.startsWith("#include <iostream>"), cpp);
+        assertFalse(cpp.contains("#include <stdio.h>"), cpp);
+        assertFalse(cpp.contains("#include <string>"), cpp);
+        assertFalse(cpp.contains("int main();"), cpp);
+        assertTrue(cpp.contains("std::cout << \"Sum = \" << (first + second);"), cpp);
+        var validation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.CPP, cpp);
+        if (validation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
+            assertTrue(validation.successful(), () -> validation.diagnostics().toString());
+
+        var lineOutput = convert(Language.C, Language.CPP,
+                "int main() { int value = 2; printf(\"value=%d\\n\", value); return 0; }");
+        assertTrue(lineOutput.successful(), () -> lineOutput.diagnostics().toString());
+        assertTrue(lineOutput.output().orElseThrow().contains("std::cout << \"value=\" << value << '\\n';"),
+                lineOutput.output().orElseThrow());
+
+        var textAndCharacter = convert(Language.C, Language.CPP,
+                "int main() { printf(\"%s%c\", \"A\", 'B'); return 0; }");
+        assertTrue(textAndCharacter.successful(), () -> textAndCharacter.diagnostics().toString());
+        assertTrue(textAndCharacter.output().orElseThrow().contains("std::cout << \"A\" << 'B';"),
+                textAndCharacter.output().orElseThrow());
     }
 
     @Test void generatedNonzeroJavaLauncherExitStatusConvertsBackToC() {
@@ -329,8 +368,8 @@ class CodeBridgePipelineTest {
     @Test void javaInstanceMethodsAreRejectedInsteadOfFlattenedToStaticFunctions() {
         var result = convert(Language.JAVA, Language.C, "class Counter { int increment(int value) { return value + 1; } }");
         assertFalse(result.successful());
-        assertEquals("CB-PARSE-JAVA-UNSUPPORTED", result.diagnostics().getFirst().code());
-        assertTrue(result.diagnostics().getFirst().message().contains("Only static Java methods are supported"));
+        assertEquals("CB-JAVA-PACKAGE-ACCESS-UNSUPPORTED", result.diagnostics().getFirst().code());
+        assertTrue(result.diagnostics().getFirst().message().contains("Package-private data classes"));
         assertTrue(result.diagnostics().getFirst().location().isPresent());
     }
 
@@ -347,7 +386,7 @@ class CodeBridgePipelineTest {
         compileCpp(generated);
     }
     @Test void javaConstructorsNestedClassesAndInstanceInitializersHaveExplicitDiagnostics() {
-        var constructor = convert(Language.JAVA, Language.C, "class Counter { Counter() { } }");
+        var constructor = convert(Language.JAVA, Language.CPP, "public class Counter { public Counter(int start) { } }");
         assertEquals("CB-JAVA-CONSTRUCTOR-UNSUPPORTED", constructor.diagnostics().getFirst().code());
         assertTrue(constructor.diagnostics().getFirst().location().isPresent());
 
@@ -524,6 +563,61 @@ class CodeBridgePipelineTest {
                 "class Values { public static final int one() { return 1; } }");
         assertTrue(converted.successful(), () -> converted.diagnostics().toString());
         assertTrue(converted.output().orElseThrow().contains("int one()"), converted.output().orElseThrow());
+    }
+
+    @Test void javaPrimitiveInstanceFieldsAndMethodsRemainInsideGeneratedCppClass() {
+        String source = "public class Counter { private int value = 1; public int get() { return value; } public void increment() { value++; } }";
+        var converted = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(converted.successful(), () -> converted.diagnostics().toString());
+        String cpp = converted.output().orElseThrow();
+        assertTrue(cpp.contains("class Counter"), cpp);
+        assertTrue(cpp.contains("private:\n    int value = 1;"), cpp);
+        assertTrue(cpp.contains("int get()"), cpp);
+        assertTrue(cpp.contains("void increment()"), cpp);
+        var validation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.CPP, cpp);
+        if (validation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
+            assertTrue(validation.successful(), () -> validation.diagnostics().toString());
+        var execution = new com.tascode.codebridge.validation.DockerSandboxExecutionService().execute(Language.CPP,
+                cpp + "\nint main() { Counter counter; counter.increment(); return counter.get() == 2 ? 0 : 1; }", "");
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                execution.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.DOCKER_UNAVAILABLE
+                        && execution.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.IMAGE_UNAVAILABLE,
+                execution.message());
+        assertTrue(execution.completed(), execution.message() + "\n" + execution.stderr());
+        assertEquals(java.util.Optional.of(0), execution.exitCode());
+
+        var byteField = convert(Language.JAVA, Language.CPP,
+                "public class ByteState { private byte value = 1; public byte get() { return value; } }");
+        assertTrue(byteField.successful(), () -> byteField.diagnostics().toString());
+        assertTrue(byteField.output().orElseThrow().contains("#include <cstdint>"), byteField.output().orElseThrow());
+    }
+
+    @Test void javaExplicitEmptyNoArgumentConstructorIsPreservedInCpp() {
+        var converted = convert(Language.JAVA, Language.CPP,
+                "public class Counter { private int value = 1; public Counter() { /* intentionally empty */ } public int get() { return value; } }");
+        assertTrue(converted.successful(), () -> converted.diagnostics().toString());
+        String cpp = converted.output().orElseThrow();
+        assertTrue(cpp.contains("public:\n    Counter() {"), cpp);
+        assertTrue(cpp.contains("private:\n    int value = 1;"), cpp);
+        var validation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.CPP, cpp);
+        if (validation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
+            assertTrue(validation.successful(), () -> validation.diagnostics().toString());
+    }
+
+    @Test void javaConstructorInitializationLogicIsRejectedWithLocation() {
+        var converted = convert(Language.JAVA, Language.CPP,
+                "public class Counter { private int value; public Counter() { value = 1; } }");
+        assertFalse(converted.successful());
+        assertEquals("CB-JAVA-CONSTRUCTOR-UNSUPPORTED", converted.diagnostics().getFirst().code());
+        assertTrue(converted.diagnostics().getFirst().location().isPresent());
+    }
+
+    @Test void javaInstanceMethodsRejectUnmappedLibraryCallsWithLocatedDiagnostic() {
+        var converted = convert(Language.JAVA, Language.CPP,
+                "public class Reporter { public void print() { System.out.println(\"hello\"); } }");
+        assertFalse(converted.successful());
+        assertEquals("CB-JAVA-INSTANCE-MEMBER-ACCESS-UNSUPPORTED", converted.diagnostics().getFirst().code());
+        assertTrue(converted.diagnostics().getFirst().location().isPresent());
     }
 
     @Test void javaLongValuesUsePortableSixtyFourBitCppTypes() {
@@ -821,6 +915,21 @@ class CodeBridgePipelineTest {
         assertTrue(javaToC.output().orElseThrow().contains("printf(\"ready\")"));
         assertTrue(javaToC.output().orElseThrow().startsWith("#include <stdio.h>"));
     }
+
+    @Test void cIntegerPrintfWithTrailingNewlineBecomesJavaPrintln() throws Exception {
+        String source = "int main() { int first = 2; int second = 3; printf(\"%d\\n\", (first + second)); return 0; }";
+        var result = convert(Language.C, Language.JAVA, source);
+        assertTrue(result.successful(), () -> result.diagnostics().toString());
+        String generated = result.output().orElseThrow();
+        assertTrue(generated.contains("System.out.println((first + second));"), generated);
+        assertFalse(generated.contains("System.out.printf"), generated);
+        Path sourceFile = tempDir.resolve("TasCodeGenerated.java");
+        Path classes = Files.createDirectory(tempDir.resolve("printf-line-classes"));
+        Files.writeString(sourceFile, generated);
+        assertEquals(0, ToolProvider.getSystemJavaCompiler().run(null, null, null,
+                "-d", classes.toString(), sourceFile.toString()), generated);
+    }
+
     @Test void crossLanguagePrintfFormatsAreCheckedConservatively() {
         var cDouble = convert(Language.C, Language.JAVA, "double show(double value) { printf(\"%lf\", value); return value; }");
         assertTrue(cDouble.successful(), () -> cDouble.diagnostics().toString());
@@ -982,7 +1091,13 @@ class CodeBridgePipelineTest {
         for (Language target : Language.values()) {
             var result = convert(Language.C, target, source);
             assertTrue(result.successful(), () -> target + ": " + result.diagnostics());
-            assertTrue(result.output().orElseThrow().contains("line\\n\\\"quoted\\\""), result.output().orElseThrow());
+            String generated = result.output().orElseThrow();
+            if (target == Language.CPP) {
+                assertTrue(generated.contains("std::cout << \"line\" << '\\n'"), generated);
+                assertTrue(generated.contains("\\\"quoted\\\""), generated);
+            } else {
+                assertTrue(generated.contains("line\\n\\\"quoted\\\""), generated);
+            }
         }
         var javaResult = convert(Language.C, Language.JAVA, source);
         Path sourceFile = tempDir.resolve("TasCodeGenerated.java");
@@ -1316,10 +1431,159 @@ class CodeBridgePipelineTest {
         String generated = result.output().orElseThrow();
         assertTrue(generated.contains("#include <stdio.h>"), generated);
         assertTrue(generated.contains("scanf(\"%d %d\", &a, &b)"), generated);
+        assertTrue(generated.contains("#include <iostream>"), generated);
+        assertTrue(generated.contains("std::cout << \"Sum = \" << (a + b);"), generated);
         var compilation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.CPP, generated);
         if (compilation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
             assertTrue(compilation.successful(), () -> compilation.diagnostics().toString());
     }
+
+    @Test void javaScannerParityProgramConvertsToCAndCppIdioms() {
+        String source = "import java.util.Scanner;\n"
+                + "public class Main {\n public static void main(String[] args) {\n"
+                + "  Scanner sc = new Scanner(System.in);\n  int n = sc.nextInt();\n"
+                + "  if (n % 2 == 0) {\n   System.out.println(\"Even\");\n  } else {\n   System.out.println(\"Odd\");\n  }\n"
+                + "  sc.close();\n }\n}";
+        var c = convert(Language.JAVA, Language.C, source);
+        assertTrue(c.successful(), () -> c.diagnostics().toString());
+        String cCode = c.output().orElseThrow();
+        assertTrue(cCode.contains("#include <stdio.h>"), cCode);
+        assertTrue(cCode.contains("int n;"), cCode);
+        assertTrue(cCode.contains("scanf(\"%d\", &n);"), cCode);
+        assertTrue(cCode.contains("puts(\"Even\");"), cCode);
+        assertTrue(cCode.contains("puts(\"Odd\");"), cCode);
+        var cValidation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.C, cCode);
+        if (cValidation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
+            assertTrue(cValidation.successful(), () -> cValidation.diagnostics().toString());
+
+        var cpp = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(cpp.successful(), () -> cpp.diagnostics().toString());
+        String cppCode = cpp.output().orElseThrow();
+        assertTrue(cppCode.contains("#include <iostream>"), cppCode);
+        assertTrue(cppCode.contains("int n;"), cppCode);
+        assertTrue(cppCode.contains("std::cin >> n;"), cppCode);
+        assertTrue(cppCode.contains("std::cout << \"Even\" << std::endl;"), cppCode);
+        assertTrue(cppCode.contains("std::cout << \"Odd\" << std::endl;"), cppCode);
+        assertFalse(cppCode.contains("Scanner"), cppCode);
+        var cppValidation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.CPP, cppCode);
+        if (cppValidation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
+            assertTrue(cppValidation.successful(), () -> cppValidation.diagnostics().toString());
+
+        String compactSource = "import java.util.Scanner; class Main { public static void main(String[] args) { "
+                + "Scanner sc = new Scanner(System.in); /* read an integer */ int n = sc.nextInt(); "
+                + "if (n % 2 == 0) System.out.println(\"Even\"); else System.out.println(\"Odd\"); sc.close(); } }";
+        var compact = convert(Language.JAVA, Language.CPP, compactSource);
+        assertTrue(compact.successful(), () -> compact.diagnostics().toString());
+        assertTrue(compact.output().orElseThrow().contains("std::cin >> n;"), compact.output().orElseThrow());
+        assertTrue(compact.output().orElseThrow().contains("std::cout << \"Odd\" << std::endl;"), compact.output().orElseThrow());
+        var compactValidation = new com.tascode.codebridge.validation.CompilerValidationService()
+                .validate(Language.CPP, compact.output().orElseThrow());
+        if (compactValidation.status() != com.tascode.codebridge.validation.ValidationStatus.COMPILER_UNAVAILABLE)
+            assertTrue(compactValidation.successful(), () -> compactValidation.diagnostics().toString());
+    }
+
+    @Test void javaScannerUnsupportedMethodsReturnLocatedDiagnostic() {
+        var result = convert(Language.JAVA, Language.CPP,
+                "import java.util.Scanner; class Main { static int read() { Scanner sc = new Scanner(System.in); int n = sc.nextLong(); return n; } }");
+        assertFalse(result.successful());
+        assertEquals("CB-JAVA-SCANNER-UNSUPPORTED", result.diagnostics().getFirst().code());
+        assertTrue(result.diagnostics().getFirst().location().isPresent());
+    }
+
+    @Test void javaScannerLongInputIsRejectedForCButSupportedForCpp() {
+        String source = "import java.util.Scanner; class Main { static long read() { "
+                + "Scanner sc = new Scanner(System.in); long value = sc.nextLong(); sc.close(); return value; } }";
+        var c = convert(Language.JAVA, Language.C, source);
+        assertFalse(c.successful());
+        assertTrue(c.diagnostics().stream().anyMatch(d -> d.code().equals("CB-JAVA-SCANNER-UNSUPPORTED")), c.diagnostics().toString());
+        var cpp = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(cpp.successful(), () -> cpp.diagnostics().toString());
+        assertTrue(cpp.output().orElseThrow().contains("std::cin >> value;"), cpp.output().orElseThrow());
+    }
+
+    @Test void javaScannerStringTokenConvertsToCppStringInput() throws Exception {
+        String source = "import java.util.Scanner; public class Main { public static void main(String[] args) { "
+                + "Scanner sc = new Scanner(System.in); String word = sc.next(); System.out.println(word); sc.close(); } }";
+        var result = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(result.successful(), () -> result.diagnostics().toString());
+        String generated = result.output().orElseThrow();
+        assertTrue(generated.contains("#include <string>"), generated);
+        assertTrue(generated.contains("std::string word;"), generated);
+        assertTrue(generated.contains("std::cin >> word;"), generated);
+        assertTrue(generated.contains("std::cout << word << std::endl;"), generated);
+        compileCpp(generated);
+        var c = convert(Language.JAVA, Language.C, source);
+        assertFalse(c.successful());
+        assertTrue(c.diagnostics().stream().anyMatch(d -> d.code().equals("CB-JAVA-SCANNER-UNSUPPORTED")), c.diagnostics().toString());
+    }
+
+    @Test void javaScannerFloatAndDoubleReadsConvertToNativeCppInput() throws Exception {
+        String source = "import java.util.Scanner; public class Main { public static void main(String[] args) { "
+                + "Scanner sc = new Scanner(System.in); long count = sc.nextLong(); float rate = sc.nextFloat(); "
+                + "double total = sc.nextDouble(); System.out.println(count); System.out.println(rate + total); sc.close(); } }";
+        var result = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(result.successful(), () -> result.diagnostics().toString());
+        String generated = result.output().orElseThrow();
+        assertTrue(generated.contains("long long count;"), generated);
+        assertTrue(generated.contains("float rate;"), generated);
+        assertTrue(generated.contains("double total;"), generated);
+        assertTrue(generated.contains("std::cin >> count;"), generated);
+        assertTrue(generated.contains("std::cin >> rate;"), generated);
+        assertTrue(generated.contains("std::cin >> total;"), generated);
+        assertTrue(generated.contains("std::cout << (rate + total) << std::endl;"), generated);
+        compileCpp(generated);
+    }
+
+    @Test void javaBasicPrimitiveOutputConvertsForAllSupportedConsoleTypes() throws Exception {
+        String source = "public class Main { public static void main(String[] args) { int i = 9; long l = 10L; "
+                + "float f = 1.5f; double d = 2.5; char c = 'A'; boolean ok = true; "
+                + "System.out.println(i); System.out.println(l); System.out.println(f); System.out.println(d); System.out.println(c); "
+                + "System.out.println(ok); } }";
+        var result = convert(Language.JAVA, Language.CPP, source);
+        assertTrue(result.successful(), () -> result.diagnostics().toString());
+        String generated = result.output().orElseThrow();
+        assertTrue(generated.contains("int i = 9;"), generated);
+        assertTrue(generated.contains("long long l = 10LL;"), generated);
+        assertTrue(generated.contains("float f = 1.5f;"), generated);
+        assertTrue(generated.contains("double d = 2.5;"), generated);
+        assertTrue(generated.contains("char c = 'A';"), generated);
+        assertTrue(generated.contains("bool ok = true;"), generated);
+        assertTrue(generated.contains("std::cout << std::boolalpha << ok << std::endl;"), generated);
+        compileCpp(generated);
+    }
+
+    @Test void unusedScannerImportDoesNotBlockConversion() {
+        var result = convert(Language.JAVA, Language.CPP,
+                "import java.util.Scanner; class Main { public static int value() { return 4; } }");
+        assertTrue(result.successful(), () -> result.diagnostics().toString());
+        assertFalse(result.output().orElseThrow().contains("Scanner"), result.output().orElseThrow());
+        assertTrue(result.output().orElseThrow().contains("int value()"), result.output().orElseThrow());
+    }
+
+    @Test void dockerSandboxCanCompareJavaScannerOutputWithGeneratedCAndCppWhenAvailable() {
+        String source = "import java.util.Scanner; public class Main { public static void main(String[] args) { "
+                + "Scanner sc = new Scanner(System.in); int n = sc.nextInt(); "
+                + "if (n % 2 == 0) System.out.println(\"Even\"); else System.out.println(\"Odd\"); sc.close(); } }";
+        var equivalence = new com.tascode.codebridge.validation.OutputEquivalenceService(
+                new com.tascode.codebridge.validation.DockerSandboxExecutionService());
+        for (Language target : List.of(Language.C, Language.CPP)) {
+            var conversion = convert(Language.JAVA, target, source);
+            assertTrue(conversion.successful(), () -> target + ": " + conversion.diagnostics());
+            var comparison = equivalence.compare(Language.JAVA, source, target,
+                    conversion.output().orElseThrow(), "7\n");
+            var sourceRun = comparison.sourceExecution().orElseThrow(() -> new AssertionError(comparison.message()));
+            org.junit.jupiter.api.Assumptions.assumeTrue(
+                    sourceRun.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.DOCKER_UNAVAILABLE
+                            && sourceRun.status() != com.tascode.codebridge.validation.SandboxExecutionStatus.IMAGE_UNAVAILABLE,
+                    sourceRun.message());
+            var targetRun = comparison.targetExecution().orElseThrow(() -> new AssertionError(comparison.message()));
+            assertTrue(sourceRun.completed(), sourceRun.message());
+            assertTrue(targetRun.completed(), targetRun.message());
+            assertEquals("Odd\n", sourceRun.stdout());
+            assertEquals(java.util.Optional.of(true), comparison.matches(), comparison.message());
+        }
+    }
+
     @Test void oneIntegerScanfStatementConvertsToJavaScanner() throws Exception {
         String source = "int readValue() { int value; scanf(\"%d\", &value); return value; }";
         var result = convert(Language.C, Language.JAVA, source);
@@ -1569,13 +1833,23 @@ class CodeBridgePipelineTest {
         }
     }
     @Test void cppOutputStreamsConvertToJavaAndRoundTripToCpp() throws Exception {
+        var singleValueLine = convert(Language.CPP, Language.JAVA,
+                "#include <iostream>\nint show(int value) { std::cout << value << std::endl; return 0; }");
+        assertTrue(singleValueLine.successful(), () -> singleValueLine.diagnostics().toString());
+        assertTrue(singleValueLine.output().orElseThrow().contains("System.out.println(value);"), singleValueLine.output().orElseThrow());
+        assertFalse(singleValueLine.output().orElseThrow().contains("System.out.print(value)"), singleValueLine.output().orElseThrow());
+        Path singleLineFile = tempDir.resolve("TasCodeGenerated.java");
+        Path singleLineClasses = Files.createDirectory(tempDir.resolve("cout-single-line-classes"));
+        Files.writeString(singleLineFile, singleValueLine.output().orElseThrow());
+        assertEquals(0, ToolProvider.getSystemJavaCompiler().run(null, null, null,
+                "-d", singleLineClasses.toString(), singleLineFile.toString()), singleValueLine.output().orElseThrow());
+
         String input = "#include <iostream>\nint show(int value) { std::cout << \"value=\" << value << std::endl; return 0; }";
         var java = convert(Language.CPP, Language.JAVA, input);
         assertTrue(java.successful(), () -> java.diagnostics().toString());
         String generated = java.output().orElseThrow();
-        assertTrue(generated.contains("System.out.print(\"value=\")"), generated);
-        assertTrue(generated.contains("System.out.print(value)"), generated);
-        assertTrue(generated.contains("System.out.println()"), generated);
+          assertTrue(generated.contains("System.out.println((\"value=\" + value))"), generated);
+          assertFalse(generated.contains("System.out.print("), generated);
         Path sourceFile = tempDir.resolve("TasCodeGenerated.java");
         Path classes = Files.createDirectory(tempDir.resolve("cout-classes"));
         Files.writeString(sourceFile, generated);
@@ -1595,8 +1869,8 @@ class CodeBridgePipelineTest {
         var unqualified = convert(Language.CPP, Language.JAVA,
                 String.join("\n", "#include <iostream>", "using namespace std;", "int show() { cout << \"ok\" << endl; return 0; }"));
         assertTrue(unqualified.successful(), () -> unqualified.diagnostics().toString());
-        assertTrue(unqualified.output().orElseThrow().contains("System.out.print(\"ok\")"), unqualified.output().orElseThrow());
-        assertTrue(unqualified.output().orElseThrow().contains("System.out.println()"), unqualified.output().orElseThrow());
+        assertTrue(unqualified.output().orElseThrow().contains("System.out.println(\"ok\")"), unqualified.output().orElseThrow());
+        assertFalse(unqualified.output().orElseThrow().contains("System.out.print(\"ok\")"), unqualified.output().orElseThrow());
         var inputChain = convert(Language.CPP, Language.JAVA,
                 String.join("\n", "#include <iostream>", "using namespace std;",
                         "int main() { int first, second; std::string word; char letter; std::cin >> first; cin >> second >> word >> letter; cout << first + second << word << letter << endl; return 0; }"));
@@ -1659,9 +1933,9 @@ class CodeBridgePipelineTest {
 
         var unsupportedCpp = convert(Language.JAVA, Language.CPP,
                 "class Printer { static void show(boolean value) { System.out.print(value); } }");
-        assertFalse(unsupportedCpp.successful());
-        assertTrue(unsupportedCpp.diagnostics().stream().anyMatch(d -> d.code().equals("CB-IO-OUTPUT-TYPE")),
-                unsupportedCpp.diagnostics().toString());
+        assertTrue(unsupportedCpp.successful(), () -> unsupportedCpp.diagnostics().toString());
+        assertTrue(unsupportedCpp.output().orElseThrow().contains("std::cout << std::boolalpha << value;"),
+                unsupportedCpp.output().orElseThrow());
     }
     @Test void javaAndCppStringsConvertWithinTheSupportedTypeSubset() throws Exception {
         String javaInput = "class Text { public static String join(String left, String right) { return left + right; } }";

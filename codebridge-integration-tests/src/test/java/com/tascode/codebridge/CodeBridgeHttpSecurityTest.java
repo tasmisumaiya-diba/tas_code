@@ -30,6 +30,9 @@ class CodeBridgeHttpSecurityTest {
             assertTrue(response.body().contains("<script nonce=\"" + nonce + "\">"));
             assertTrue(response.body().contains("<style nonce=\"" + nonce + "\">"));
             assertTrue(response.body().contains("<summary>Advanced options</summary>"));
+            assertTrue(response.body().contains("hasWarnings?'Conversion succeeded with warnings; review the diagnostics.'"));
+            assertTrue(response.body().contains("comparison.matches===false||!result.success?'error':comparison.matches===true?'success':'warning'"),
+                    "An inconclusive comparison must be shown as a warning, while conversion/compile failures remain errors.");
             String basicControls = response.body().substring(response.body().indexOf("<div class=\"controls\">"),
                     response.body().indexOf("<details class=\"advanced-options\">"));
             assertFalse(basicControls.contains("id=\"validate\""));

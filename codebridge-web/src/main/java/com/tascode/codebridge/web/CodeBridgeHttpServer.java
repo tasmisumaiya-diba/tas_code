@@ -13,6 +13,7 @@ import com.tascode.codebridge.pipeline.ConversionPipeline;
 import com.tascode.codebridge.pipeline.ConversionResult;
 import com.tascode.codebridge.preprocess.CPreprocessor;
 import com.tascode.codebridge.validation.CompilationResult;
+import com.tascode.codebridge.validation.CompilationValidator;
 import com.tascode.codebridge.validation.CompilerValidationService;
 import com.tascode.codebridge.validation.DockerSandboxExecutionService;
 import com.tascode.codebridge.validation.OutputComparisonResult;
@@ -33,6 +34,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -46,7 +48,7 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
     private final byte[] apiToken;
     private final ConversionPipeline pipeline;
     private final ValidatedConversionService validated;
-    private final CompilerValidationService compilerValidator;
+    private final CompilationValidator compilerValidator;
     private final OutputEquivalenceService equivalence;
     private final ClangSemanticFrontend clangFrontend = new ClangSemanticFrontend();
     private final ClangIrLowerer clangIrLowerer = new ClangIrLowerer();
@@ -56,7 +58,7 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
     }
 
     CodeBridgeHttpServer(InetSocketAddress address, ConversionPipeline pipeline, CompilerValidationService validator) throws IOException {
-        this(address, pipeline, validator, null);
+        this(address, pipeline, validator, new OutputEquivalenceService(new DockerSandboxExecutionService()), null);
     }
 
     public CodeBridgeHttpServer(InetSocketAddress address, String apiToken) throws IOException {
@@ -65,12 +67,17 @@ public final class CodeBridgeHttpServer implements AutoCloseable {
 
     private CodeBridgeHttpServer(InetSocketAddress address, ConversionPipeline pipeline,
             CompilerValidationService validator, String apiToken) throws IOException {
+        this(address, pipeline, validator, new OutputEquivalenceService(new DockerSandboxExecutionService()), apiToken);
+    }
+
+    CodeBridgeHttpServer(InetSocketAddress address, ConversionPipeline pipeline, CompilationValidator validator,
+            OutputEquivalenceService equivalence, String apiToken) throws IOException {
         this.apiToken = apiToken == null ? null : validatedTokenBytes(apiToken);
-        this.server = createBoundServer(address);
-        this.pipeline = pipeline;
-        this.validated = new ValidatedConversionService(pipeline, validator);
-        this.compilerValidator = validator;
-        this.equivalence = new OutputEquivalenceService(new DockerSandboxExecutionService());
+        this.pipeline = Objects.requireNonNull(pipeline, "pipeline");
+        this.compilerValidator = Objects.requireNonNull(validator, "validator");
+        this.equivalence = Objects.requireNonNull(equivalence, "equivalence");
+        this.validated = new ValidatedConversionService(this.pipeline, this.compilerValidator);
+        this.server = createBoundServer(Objects.requireNonNull(address, "address"));
         server.createContext("/api/health", this::health);
         server.createContext("/api/convert", protectApi(this::convert));
         server.createContext("/api/analyze", protectApi(this::analyze));

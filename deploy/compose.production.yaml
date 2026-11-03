@@ -1,0 +1,68 @@
+services:
+  codebridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      CODEBRIDGE_BIND_ADDRESS: 0.0.0.0
+      CODEBRIDGE_PORT: 8080
+      CODEBRIDGE_AUTH_TOKEN: ${CODEBRIDGE_AUTH_TOKEN:?Set CODEBRIDGE_AUTH_TOKEN in deploy/.env.production}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 128
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "java", "-cp", "/app/codebridge.jar:/app/lib/*", "com.tascode.codebridge.web.HealthProbe", "8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - backend
+
+  proxy:
+    image: nginx:stable-alpine
+    entrypoint: ["nginx"]
+    command: ["-g", "daemon off;"]
+    depends_on:
+      codebridge:
+        condition: service_healthy
+    ports:
+      - "${CODEBRIDGE_HTTPS_BIND:-127.0.0.1}:${CODEBRIDGE_HTTPS_PORT:-8443}:443"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/cache/nginx:rw,noexec,nosuid,size=32m
+      - /var/run:rw,noexec,nosuid,size=8m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - edge
+      - backend
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true

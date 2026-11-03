@@ -145,6 +145,10 @@ For a reverse proxy on the same machine, the app can bind to `127.0.0.1`; let th
 
 At startup, CodeBridge prints a warning to standard error if it binds to a non-loopback address because TLS is not provided by the app; when a token is configured, the warning notes that bearer authentication is enabled but still recommends a trusted network and TLS reverse proxy.
 
+### Private-host deployment
+
+A single-host Docker Compose deployment is provided in [`docs/production-deployment.md`](docs/production-deployment.md). It publishes Nginx TLS on loopback by default, rate-limits API routes, requires an API token, and keeps the Java app on an internal container network. The app receives no Docker socket: Clang analysis and Docker run/compare are consequently unavailable in this deployment profile. Review the documented network boundary and firewall steps before allowing LAN access.
+
 HTTP responses include `nosniff`, frame denial, no-referrer, no-store caching, and a restrictive content security policy. The UI's inline script and style use per-response nonces. These browser protections do not replace authentication, TLS, a reverse proxy, or network restrictions.
 
 ## HTTP API
@@ -260,8 +264,8 @@ Tests cover positive conversions, negative diagnostics, golden examples for all 
 - C/C++ pointers and references, global state, structs/unions, function pointers, `switch`, `goto`, and arbitrary preprocessor behavior are not generally translated.
 - Java object identity, null/GC behavior, UTF-16 details, C++ deterministic destruction/RAII, and C undefined or implementation-defined behavior can differ fundamentally; unsupported cases should be diagnosed rather than guessed.
 - Compiler checks validate generated syntax and types only. Behavioral equivalence requires executable entry points and the Docker comparison path; even then it compares stdout and exit status for the supplied input, not every possible input.
-- There is no file upload control or public hosting configuration. The server is intended for local use and binds to loopback by default. Optional bearer authentication covers convert/analyze APIs; the UI, health route, and TLS still require network/reverse-proxy protection when deployed remotely.
-- Environment-based bind and optional API-token configuration are available, but production deployment is not complete: TLS termination, reverse-proxy configuration, container image for the Java service, and orchestrator/service definition remain unimplemented. Keep it behind a trusted reverse proxy/network.
+- There is no file upload control or public multi-tenant hosting configuration. The standalone server is intended for local use and binds to loopback by default. The private-host Compose profile provides TLS termination and rate limiting at Nginx; use its documented firewall boundary for remote access.
+- The private-host profile does not mount the Docker socket. As a result, Clang analysis and Docker-based execution comparison are unavailable there; C/C++ compiler validation is unavailable because the image has no native toolchains. The owner must provision and renew certificates, restrict the firewall, review/pin image digests, and verify deployment on the intended host before release.
 
 ## Development rules
 

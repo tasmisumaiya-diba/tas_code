@@ -30,6 +30,9 @@ public final class FunctionCallAnalyzer {
         for (FunctionDeclaration function : program.functions()) {
             Map<String, String> locals = new HashMap<>();
             program.globals().forEach(global -> locals.put(global.name(), normalize(global.type())));
+            program.classes().forEach(type -> type.fields().stream()
+                    .filter(field -> field.modifiers().contains("public"))
+                    .forEach(field -> locals.put("__field:" + type.name() + "." + field.name(), normalize(field.type().name()))));
             function.parameters().forEach(parameter -> locals.put(parameter.name(), normalize(parameter.type())));
             collectLocals(function.body(), locals);
             visitBlock(function.body(), functions, locals, sourceLanguage, targetLanguage, diagnostics);
@@ -105,6 +108,24 @@ public final class FunctionCallAnalyzer {
         if (expression instanceof AssignmentExpression assignment) return containsFunctionCall(assignment.value());
         if (expression instanceof ArrayAccessExpression access) return containsFunctionCall(access.array()) || containsFunctionCall(access.index());
         return false;
+    }
+    private boolean hasExpressionSideEffects(Expression expression) {
+        if (expression instanceof CallExpression || expression instanceof AssignmentExpression || expression instanceof UpdateExpression) return true;
+        if (expression instanceof BinaryExpression binary) return hasExpressionSideEffects(binary.left()) || hasExpressionSideEffects(binary.right());
+        if (expression instanceof UnaryExpression unary) return hasExpressionSideEffects(unary.operand());
+        if (expression instanceof ArrayAccessExpression access) return hasExpressionSideEffects(access.array()) || hasExpressionSideEffects(access.index());
+        return false;
+    }
+    private Optional<Long> integerLiteralValue(Expression expression) {
+        if (expression instanceof LiteralExpression literal && literal.value() instanceof Number number) {
+            return Optional.of(number.longValue());
+        }
+        if (expression instanceof UnaryExpression unary && (unary.operator().equals("+") || unary.operator().equals("-"))) {
+            Optional<Long> operand = integerLiteralValue(unary.operand());
+            if (operand.isEmpty()) return Optional.empty();
+            return Optional.of(unary.operator().equals("-") ? -operand.get() : operand.get());
+        }
+        return Optional.empty();
     }
     private void collectLocals(BlockStatement block, Map<String, String> locals) {
         for (Statement statement : block.statements()) {
@@ -205,7 +226,28 @@ public final class FunctionCallAnalyzer {
                 && typeOf(expression, locals, functions).equals("char")) {
             runtimeWarning("CB-JAVA-CPP-CHAR-WIDTH", "Java char is a 16-bit UTF-16 code unit; C++ char is a byte. This conversion is safe only for values representable in the target execution character set.", expression.sourceSpan(), diagnostics);
         }
-        if (expression instanceof CallExpression call) {
+        if (expression instanceof NameExpression name) {
+            if (source == Language.JAVA && target == Language.CPP && name.name().contains(".")
+                    && typeOf(name, locals, functions).equals("unknown")) {
+                errorAt("CB-JAVA-OBJECT-FIELD-UNSUPPORTED",
+                        "Only public primitive fields on a supported local Java data object can be accessed from outside its class.",
+                        name.sourceSpan(), diagnostics);
+            }
+        } else if (expression instanceof CallExpression call) {
+            if (call.callee().equals("__codebridge_array_length")) {
+                if (source != Language.JAVA || target != Language.CPP) {
+                    error("CB-JAVA-ARRAY-LENGTH-TARGET-UNSUPPORTED",
+                            "Java array length currently converts only to C++, where Java arrays map to std::vector.", call, diagnostics);
+                } else if (call.arguments().size() != 1) {
+                    error("CB-JAVA-ARRAY-LENGTH-ARITY", "Java array length does not take arguments.", call, diagnostics);
+                } else {
+                    String arrayType = typeOf(call.arguments().getFirst(), locals, functions);
+                    if (!arrayType.endsWith("[]")) errorAt("CB-JAVA-ARRAY-LENGTH-RECEIVER",
+                            "The .length property is supported only on a declared Java array.",
+                            call.arguments().getFirst().sourceSpan(), diagnostics);
+                }
+                return;
+            }
             if (source == Language.JAVA && (target == Language.C || target == Language.CPP)
                     && Set.of("__codebridge_read_int", "__codebridge_read_long", "__codebridge_read_float", "__codebridge_read_double", "__codebridge_read_string", "__codebridge_read_line").contains(call.callee())) {
                 String readType = switch (call.callee()) {
@@ -270,29 +312,92 @@ public final class FunctionCallAnalyzer {
                 if (!call.arguments().isEmpty()) error("CB-STRING-METHOD-ARITY", "String.length() and String.isEmpty() take no arguments.", call, diagnostics);
             } else if (source == Language.JAVA && target == Language.CPP && isMappedMathMethod(call)) {
                 int expected = call.callee().endsWith(".pow") ? 2 : 1;
-                if (call.arguments().size() != expected) error("CB-JAVA-MATH-ARITY", "Math method " + call.callee() + " expects " + expected + " numeric argument(s).", call, diagnostics);
-                runtimeWarning("CB-JAVA-CPP-MATH-ROUNDING", "Java Math and the C++ standard library can differ at floating-point rounding boundaries; verify results that depend on exact last-bit values.", call.sourceSpan(), diagnostics);
+                if (call.arguments().size() != expected) {
+                    error("CB-JAVA-MATH-ARITY", "Math method " + call.callee() + " expects " + expected + " numeric argument(s).", call, diagnostics);
+                } else {
+                    for (Expression argument : call.arguments()) {
+                        if (!NUMERIC.contains(typeOf(argument, locals, functions))) {
+                            errorAt("CB-JAVA-MATH-TYPE", "Math method " + call.callee() + " requires numeric arguments.", argument.sourceSpan(), diagnostics);
+                        }
+                    }
+                    if (call.callee().equals("Math.abs")) {
+                        if (call.arguments().size() == 1 && javaIntegral(typeOf(call.arguments().getFirst(), locals, functions))) {
+                            runtimeWarning("CB-JAVA-CPP-MATH-ABS-OVERFLOW",
+                                    "Java Math.abs of the minimum value returns that value; C++ std::abs cannot represent its positive magnitude. Keep the input above the minimum value.",
+                                    call.sourceSpan(), diagnostics);
+                        }
+                    } else {
+                        runtimeWarning("CB-JAVA-CPP-MATH-ROUNDING", "Java Math and the C++ standard library can differ at floating-point rounding boundaries; verify results that depend on exact last-bit values.", call.sourceSpan(), diagnostics);
+                    }
+                }
             } else if (!isSupportedOutputCall(call.callee(), source)) {
                 error("CB-CALL-UNRESOLVED", "Function '" + call.callee() + "' is not declared or supported.", call, diagnostics);
             } else checkOutputCall(call, source, target, locals, functions, diagnostics);
             call.arguments().forEach(argument -> visitExpression(argument, functions, locals, source, target, diagnostics));
         } else if (expression instanceof BinaryExpression binary) {
             if (source == Language.JAVA && target == Language.CPP
+                    && Set.of("/", "%").contains(binary.operator())
+                    && javaIntegral(typeOf(binary.left(), locals, functions))
+                    && javaIntegral(typeOf(binary.right(), locals, functions))) {
+                Optional<Long> divisor = integerLiteralValue(binary.right());
+                if (divisor.isPresent() && divisor.get() == 0L) {
+                    errorAt("CB-JAVA-CPP-DIVIDE-BY-ZERO",
+                            "Java throws ArithmeticException for integral division or remainder by zero; the equivalent C++ operation has undefined behavior.",
+                            binary.right().sourceSpan(), diagnostics);
+                } else if (divisor.isEmpty()) {
+                    runtimeWarning("CB-JAVA-CPP-DIVISOR-MAY-BE-ZERO",
+                            "Java throws ArithmeticException if this integral divisor is zero; C++ has undefined behavior. Ensure the divisor is non-zero before this operation.",
+                            binary.sourceSpan(), diagnostics);
+                }
+            }
+            boolean booleanBitwise = Set.of("&", "|", "^").contains(binary.operator())
+                    && typeOf(binary.left(), locals, functions).equals("bool")
+                    && typeOf(binary.right(), locals, functions).equals("bool");
+            if (source == Language.JAVA && target == Language.CPP && booleanBitwise
+                    && (hasExpressionSideEffects(binary.left()) || hasExpressionSideEffects(binary.right()))) {
+                errorAt("CB-JAVA-CPP-BOOL-BITWISE-ORDER",
+                        "Java evaluates boolean bitwise operands left to right; C++ does not specify their evaluation order. Move side effects into separate statements before conversion.",
+                        binary.sourceSpan(), diagnostics);
+            }
+            if (source == Language.JAVA && target == Language.CPP
+                    && Set.of("<<", ">>").contains(binary.operator())
+                    && javaIntegral(typeOf(binary.left(), locals, functions))
+                    && javaIntegral(typeOf(binary.right(), locals, functions))) {
+                runtimeWarning("CB-JAVA-CPP-SHIFT-DISTANCE",
+                        "Java masks integral shift distances to the low 5 bits (6 for long); C++ requires the shift count to be non-negative and smaller than the left operand width. Keep the count in range to preserve behavior.",
+                        binary.sourceSpan(), diagnostics);
+            }
+            if (source == Language.JAVA && target == Language.CPP
                     && Set.of("+", "-", "*", "/", "%", "<<").contains(binary.operator())
                     && javaIntegral(typeOf(binary.left(), locals, functions))
                     && javaIntegral(typeOf(binary.right(), locals, functions))) {
-                diagnostics.add(Diagnostic.at(Severity.WARNING, "CB-JAVA-CPP-INTEGER-OVERFLOW-POSSIBLE",
-                        "Java integer arithmetic wraps on overflow; signed C++ overflow is undefined. Keep this operation within the Java type's range.",
-                        binary.sourceSpan()));
+                warnJavaIntegerOverflow(binary.sourceSpan(), diagnostics);
             }
             visitExpression(binary.left(), functions, locals, source, target, diagnostics);
             visitExpression(binary.right(), functions, locals, source, target, diagnostics);
-        } else if (expression instanceof UnaryExpression unary) visitExpression(unary.operand(), functions, locals, source, target, diagnostics);
+        } else if (expression instanceof UnaryExpression unary) {
+            if (source == Language.JAVA && target == Language.CPP && unary.operator().equals("-")
+                    && javaIntegral(typeOf(unary.operand(), locals, functions))) {
+                warnJavaIntegerOverflow(unary.sourceSpan(), diagnostics);
+            }
+            visitExpression(unary.operand(), functions, locals, source, target, diagnostics);
+        } else if (expression instanceof UpdateExpression update) {
+            if (source == Language.JAVA && target == Language.CPP
+                    && javaIntegral(typeOf(update.target(), locals, functions))) {
+                warnJavaIntegerOverflow(update.sourceSpan(), diagnostics);
+            }
+        }
         else if (expression instanceof AssignmentExpression assignment) {
             checkCallValueCompatibility(typeOf(assignment.target(), locals, functions), assignment.value(), functions, locals, source, target, diagnostics, "assignment");
             visitExpression(assignment.target(), functions, locals, source, target, diagnostics);
             visitExpression(assignment.value(), functions, locals, source, target, diagnostics);
         } else if (expression instanceof ArrayAccessExpression access) {
+            if (source == Language.JAVA && target == Language.CPP
+                    && typeOf(access.array(), locals, functions).endsWith("[]")) {
+                runtimeWarning("CB-JAVA-CPP-ARRAY-BOUNDS",
+                        "Java array access checks bounds and throws on an invalid index; the current C++ mapping uses unchecked vector indexing. Ensure every index is between 0 and array.length - 1.",
+                        access.sourceSpan(), diagnostics);
+            }
             checkCallIntegral(access.index(), functions, locals, source, target, diagnostics, "array index");
             visitExpression(access.array(), functions, locals, source, target, diagnostics);
             visitExpression(access.index(), functions, locals, source, target, diagnostics);
@@ -301,7 +406,7 @@ public final class FunctionCallAnalyzer {
 
     private boolean isMappedMathMethod(CallExpression call) {
         if (!call.callee().startsWith("Math.")) return false;
-        return Set.of("Math.sqrt", "Math.pow", "Math.floor", "Math.ceil").contains(call.callee());
+        return Set.of("Math.sqrt", "Math.pow", "Math.floor", "Math.ceil", "Math.abs").contains(call.callee());
     }
 
     private boolean isStringOneArgumentMethod(CallExpression call, Map<String, String> locals) {
@@ -453,7 +558,16 @@ boolean puts = call.callee().equals("puts");
             if (literal.value() instanceof Double) return "double";
             if (literal.value() instanceof Number) return "int";
             if (literal.value() instanceof String) return "string";
-        } else if (expression instanceof NameExpression name) return locals.getOrDefault(name.name(), "unknown");
+        } else if (expression instanceof NameExpression name) {
+            String direct = locals.get(name.name());
+            if (direct != null) return direct;
+            int member = name.name().indexOf('.');
+            if (member > 0 && name.name().indexOf('.', member + 1) < 0) {
+                String receiverType = locals.getOrDefault(name.name().substring(0, member), "unknown");
+                return locals.getOrDefault("__field:" + receiverType + name.name().substring(member), "unknown");
+            }
+            return "unknown";
+        }
         else if (expression instanceof ArrayAccessExpression access) {
             String array = typeOf(access.array(), locals, functions);
             return array.endsWith("[]") ? array.substring(0, array.length() - 2) : "unknown";
@@ -461,6 +575,10 @@ boolean puts = call.callee().equals("puts");
             if (Set.of("==", "!=", "<", ">", "<=", ">=", "&&", "||").contains(binary.operator())) return "bool";
             String left = typeOf(binary.left(), locals, functions);
             String right = typeOf(binary.right(), locals, functions);
+            if (Set.of("<<", ">>").contains(binary.operator())) {
+                return Set.of("byte", "short", "char").contains(left) ? "int" : left;
+            }
+            if (Set.of("&", "|", "^").contains(binary.operator()) && left.equals("bool") && right.equals("bool")) return "bool";
             if (NUMERIC.contains(left) && NUMERIC.contains(right)) return wider(left, right);
             if (binary.operator().equals("+") && left.equals("string") && right.equals("string")) return "string";
             if (!left.equals("unknown") && !right.equals("unknown")) return "invalid";
@@ -471,6 +589,12 @@ boolean puts = call.callee().equals("puts");
         } else if (expression instanceof AssignmentExpression assignment) return typeOf(assignment.target(), locals, functions);
         else if (expression instanceof UpdateExpression update) return typeOf(update.target(), locals, functions);
         else if (expression instanceof CallExpression call) {
+            if (call.callee().equals("__codebridge_array_length")) return "int";
+            if (call.callee().equals("Math.abs") && call.arguments().size() == 1) {
+                String argument = typeOf(call.arguments().getFirst(), locals, functions);
+                return Set.of("byte", "short", "char").contains(argument) ? "int" : argument;
+            }
+            if (Set.of("Math.sqrt", "Math.pow", "Math.floor", "Math.ceil").contains(call.callee())) return "double";
             FunctionDeclaration resolved = resolveFunction(call, functions, locals, Language.CPP, Language.CPP);
             if (resolved != null) return normalize(resolved.returnType());
         }
@@ -521,6 +645,12 @@ boolean puts = call.callee().equals("puts");
         return callee;
     }
     private boolean javaIntegral(String type) { return Set.of("byte", "short", "char", "int", "long").contains(type); }
+    private void warnJavaIntegerOverflow(com.tascode.codebridge.diagnostic.SourceSpan span,
+                                         List<Diagnostic> diagnostics) {
+        runtimeWarning("CB-JAVA-CPP-INTEGER-OVERFLOW-POSSIBLE",
+                "Java integer arithmetic wraps on overflow; signed C++ overflow is undefined. Keep this operation within the Java type's range.",
+                span, diagnostics);
+    }
     private void runtimeWarning(String code, String message, com.tascode.codebridge.diagnostic.SourceSpan span,
                                 List<Diagnostic> diagnostics) {
         if (diagnostics.stream().noneMatch(d -> d.code().equals(code) && d.location().filter(span::equals).isPresent()))

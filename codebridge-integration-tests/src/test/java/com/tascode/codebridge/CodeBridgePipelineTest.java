@@ -614,7 +614,7 @@ class CodeBridgePipelineTest {
 
     @Test void javaInstanceMethodsRejectUnmappedLibraryCallsWithLocatedDiagnostic() {
         var converted = convert(Language.JAVA, Language.CPP,
-                "public class Reporter { public void print() { System.out.println(\"hello\"); } }");
+                "public class Reporter { public double random() { return Math.random(); } }");
         assertFalse(converted.successful());
         assertEquals("CB-JAVA-INSTANCE-MEMBER-ACCESS-UNSUPPORTED", converted.diagnostics().getFirst().code());
         assertTrue(converted.diagnostics().getFirst().location().isPresent());
@@ -2028,7 +2028,7 @@ class CodeBridgePipelineTest {
                 "class Text { public static int length(String value) { return value.length(); } public static boolean empty(String value) { return value.isEmpty(); } }");
         assertTrue(stringMethods.successful(), () -> stringMethods.diagnostics().toString());
         String methodsCpp = stringMethods.output().orElseThrow();
-        assertTrue(methodsCpp.contains("return value.length();"), methodsCpp);
+        assertTrue(methodsCpp.contains("return __codebridge_java_string_length(value);"), methodsCpp);
         assertTrue(methodsCpp.contains("return value.empty();"), methodsCpp);
         var methodsValidation = new com.tascode.codebridge.validation.CompilerValidationService().validate(Language.CPP, methodsCpp);
         assertEquals(com.tascode.codebridge.validation.ValidationStatus.VALID, methodsValidation.status(), methodsValidation.diagnostics().toString());

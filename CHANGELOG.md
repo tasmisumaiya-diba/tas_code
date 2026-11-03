@@ -2,6 +2,25 @@
 
 Meaningful changes are recorded here. This project has not yet adopted tagged releases; entries describe repository work and do not imply a published version.
 
+## 2026-11-04 — Unreleased
+
+- Java-to-C++ now maps `Math.abs` to `std::abs`, validates its numeric input, emits the required `<cmath>` include, and warns about integral minimum-value overflow.
+- Java-to-C++ integral `/` and `%` reject literal zero divisors and warn when a non-literal divisor may be zero, reflecting Java's exception versus C++ undefined behavior.
+- Java-to-C++ now rejects multiple `Scanner(System.in)` instances with `CB-JAVA-SCANNER-MULTIPLE-UNSUPPORTED`; Java Scanner instances can buffer the shared input independently, unlike the single C++ stream mapping.
+- Java Scanner input now rejects a read after any Scanner closes `System.in`, instead of silently removing `close()` and generating a program that keeps reading. Closing after the final recognized read remains supported.
+- Java-to-C++ now accepts side-effect-free boolean `&`, `|`, and `^` expressions. It rejects forms with calls, assignments, or updates in either operand because Java and C++ do not guarantee the same operand evaluation order.
+- Java `>>>` now receives the located `CB-JAVA-UNSIGNED-SHIFT-UNSUPPORTED` diagnostic instead of falling through to a generic expression parse error.
+- Conversion pipeline diagnostics now block output only when severity is `ERROR`; warnings can accompany successful generated code and flow to the existing UI warning state. This enables Java-to-C++ semantic warnings without discarding otherwise generated output.
+- Java-to-C++ local objects can now read/write public primitive fields from surrounding functions. Field types are resolved for assignment compatibility; unknown, private, or protected external fields produce a located unsupported diagnostic. The Java/C++ Maven modules compile successfully after this change; focused behavior tests were not run in this step.
+- Instance methods may now spell supported same-class field and method access explicitly as `this.field` and `this.method()`. The lowering removes the redundant receiver while preserving source offsets; bare `this` and `super` remain unsupported.
+- Calls written as `ClassName.staticMethod()` and references to known static fields written as `ClassName.staticField` now lower to their existing free-function/global representations. Compilation succeeded; focused behavior verification remains outstanding.
+- Supported `System.out.print`, `println`, and `printf` calls are now allowed in otherwise supported primitive instance methods and use the existing output conversion rules. Other qualified library access remains rejected.
+- Java array `.length` now lowers to `static_cast<int>(array.size())` in C++ and is rejected for C, whose current array model cannot preserve a runtime length. The changed Java/C++ code compiles; behavior tests remain outstanding.
+- Java array indexing now emits `CB-JAVA-CPP-ARRAY-BOUNDS` when a typed array access maps to unchecked C++ vector indexing; integral-index checks still run. This warns about the Java exception-versus-C++ undefined-behavior difference instead of silently suggesting equivalent bounds behavior.
+- `CB-JAVA-CPP-INTEGER-OVERFLOW-POSSIBLE` now also covers integral unary negation and increment/decrement in Java-to-C++, where Java wraparound is not preserved by C++ signed arithmetic.
+- Java-to-C++ integral `<<` and `>>` now emit `CB-JAVA-CPP-SHIFT-DISTANCE` because Java masks oversized or negative shift distances while C++ requires a valid non-negative count.
+- Shift expression type resolution now follows the promoted left operand, instead of incorrectly widening to the shift-count type. This matches Java and C++ shift result typing and improves subsequent compatibility checks.
+
 ## 2026-11-03 — Unreleased
 
 - Java-to-C++ now supports local stack construction of the supported class using a no-argument constructor, plus calls to supported instance methods on those local objects. Object alias/copy operations and object-valued method signatures are rejected to avoid Java-reference/C++-value semantic mismatches.

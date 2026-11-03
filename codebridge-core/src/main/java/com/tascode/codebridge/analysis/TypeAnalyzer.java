@@ -16,6 +16,8 @@ public final class TypeAnalyzer {
             Deque<Map<String, String>> scopes = new ArrayDeque<>();
             Map<String, String> translationUnitNames = program.globals().stream().collect(java.util.stream.Collectors.toMap(GlobalVariableDeclaration::name, global -> normalize(global.type()), (a, b) -> a, HashMap::new));
             program.enums().forEach(enumeration -> enumeration.enumerators().forEach(enumerator -> translationUnitNames.put(enumerator.name(), "int")));
+            program.classes().forEach(type -> type.fields().forEach(field -> translationUnitNames.put(
+                    "__field:" + type.name() + "." + field.name(), normalize(field.type().name()))));
             scopes.push(translationUnitNames);
             scopes.push(new HashMap<>());
             for (Parameter parameter : function.parameters()) scopes.peek().put(parameter.name(), normalize(parameter.type()));
@@ -195,11 +197,23 @@ public final class TypeAnalyzer {
             if (value instanceof String) return "string";
         } else if (expression instanceof NameExpression name) {
             for (Map<String, String> scope : scopes) if (scope.containsKey(name.name())) return scope.get(name.name());
+            int member = name.name().indexOf('.');
+            if (member > 0 && name.name().indexOf('.', member + 1) < 0) {
+                String receiverType = "unknown";
+                String receiverName = name.name().substring(0, member);
+                for (Map<String, String> scope : scopes) if (scope.containsKey(receiverName)) {
+                    receiverType = scope.get(receiverName);
+                    break;
+                }
+                String fieldKey = "__field:" + receiverType + name.name().substring(member);
+                for (Map<String, String> scope : scopes) if (scope.containsKey(fieldKey)) return scope.get(fieldKey);
+            }
         } else if (expression instanceof ArrayAccessExpression access) {
             String array = typeOf(access.array(), scopes);
             return array.endsWith("[]") ? array.substring(0, array.length() - 2) : "unknown";
         } else if (expression instanceof AssignmentExpression assignment) return typeOf(assignment.target(), scopes);
         else if (expression instanceof UpdateExpression update) return typeOf(update.target(), scopes);
+        else if (expression instanceof CallExpression call && call.callee().equals("__codebridge_array_length")) return "int";
         else if (expression instanceof UnaryExpression unary) {
             if (unary.operator().equals("!")) return "bool";
             String operand = typeOf(unary.operand(), scopes);
@@ -208,6 +222,8 @@ public final class TypeAnalyzer {
         else if (expression instanceof BinaryExpression binary) {
             if (Set.of("==", "!=", "<", ">", "<=", ">=", "&&", "||").contains(binary.operator())) return "bool";
             String left = typeOf(binary.left(), scopes), right = typeOf(binary.right(), scopes);
+            if (Set.of("&", "|", "^").contains(binary.operator()) && left.equals("bool") && right.equals("bool")) return "bool";
+            if (Set.of("<<", ">>").contains(binary.operator())) return Set.of("byte", "short", "char").contains(left) ? "int" : left;
             if (NUMERIC.contains(left) && NUMERIC.contains(right)) return wider(left, right);
             if (binary.operator().equals("+") && left.equals("string") && right.equals("string")) return "string";
             return left.equals("unknown") || right.equals("unknown") ? "unknown" : "unknown";

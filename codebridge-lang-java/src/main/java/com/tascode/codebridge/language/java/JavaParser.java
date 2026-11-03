@@ -30,6 +30,7 @@ public final class JavaParser implements LanguageParser {
             new UnsupportedJavaSyntax(Pattern.compile("\\bchar\\s*\\[\\s*\\]"), "CB-JAVA-ARRAY-ELEMENT-UNSUPPORTED", "Java char arrays use UTF-16 elements and cannot be represented by the current C++ char-array mapping."),
             new UnsupportedJavaSyntax(Pattern.compile("\\bnull\\b"), "CB-JAVA-NULL-UNSUPPORTED", "Java null references have no supported C++ representation in this subset."),
             new UnsupportedJavaSyntax(Pattern.compile("\\bvar\\b"), "CB-JAVA-VAR-UNSUPPORTED", "Java local-variable type inference is outside the supported subset; declare the variable type explicitly."),
+            new UnsupportedJavaSyntax(Pattern.compile(">>>"), "CB-JAVA-UNSIGNED-SHIFT-UNSUPPORTED", "Java's unsigned right shift (>>>) requires explicit unsigned bit-width conversions that are not represented in the current C++ IR."),
             new UnsupportedJavaSyntax(Pattern.compile("\\bswitch\\s*\\("), "CB-JAVA-SWITCH-UNSUPPORTED", "Java switch statements and expressions are outside the current IR subset."),
             new UnsupportedJavaSyntax(Pattern.compile("@[A-Za-z_$][\\w$]*"), "CB-JAVA-ANNOTATION-UNSUPPORTED", "Java annotations are not preserved by the current C++ generator."),
             new UnsupportedJavaSyntax(Pattern.compile("\\b(?:record|sealed|permits|native)\\b"), "CB-JAVA-MODERN-TYPE-UNSUPPORTED", "Java records, sealed declarations, and native methods are outside the supported subset."),
@@ -54,6 +55,8 @@ public final class JavaParser implements LanguageParser {
         if (!fieldExtraction.diagnostics().isEmpty()) return new ParseResult(null, fieldExtraction.diagnostics());
         source = fieldExtraction.source();
         String className = frontendResult.model().orElseThrow().types().getFirst().name();
+        source = normalizeClassQualifiedStaticAccess(source, className, frontendResult.model().orElseThrow());
+        source = normalizeThisQualifiedMembers(source);
         java.util.Set<String> stackObjects = fieldExtraction.classes().isEmpty()
                 ? java.util.Set.of() : simpleObjectNames(source, className);
         if (!stackObjects.isEmpty()) source = normalizeSimpleObjectDeclarations(source, className);
@@ -122,7 +125,7 @@ public final class JavaParser implements LanguageParser {
             ParseResult result = new SubsetFunctionParser(Language.JAVA,
                     java.util.Set.of(frontendResult.model().orElseThrow().types().getFirst().name())).parse(normalized);
             if (result.successful() && result.root() instanceof com.tascode.codebridge.ir.Program program) {
-                var lowered = attachInstanceMethods(program, fieldExtraction, originalSource);
+                var lowered = attachInstanceMethods(program, fieldExtraction, originalSource, frontendResult.model().orElseThrow());
                 if (!lowered.diagnostics().isEmpty()) return new ParseResult(null, lowered.diagnostics());
                 return new ParseResult(lowered.program(), result.diagnostics(), frontendResult.diagnostics());
             }
@@ -162,8 +165,28 @@ public final class JavaParser implements LanguageParser {
             return scannerFailure(source, "CB-JAVA-SCANNER-UNSUPPORTED",
                     "Supported Scanner input must be initialized with new Scanner(System.in).", Math.max(0, source.indexOf("Scanner")));
         }
+        if (scannerNames.size() > 1) {
+            return scannerFailure(source, "CB-JAVA-SCANNER-MULTIPLE-UNSUPPORTED",
+                    "Multiple Java Scanner objects can buffer System.in independently, while the C++ mapping uses one shared stream. Use a single Scanner variable for all input reads.",
+                    source.indexOf("Scanner"));
+        }
         String scannerAlternation = scannerNames.stream().map(Pattern::quote)
                 .collect(java.util.stream.Collectors.joining("|", "(?:", ")"));
+        Pattern inputReadPattern = Pattern.compile("\\b(?:" + scannerAlternation.substring(3, scannerAlternation.length() - 1)
+                + ")\\s*\\.\\s*(?:nextInt|nextLong|nextFloat|nextDouble|next|nextLine)\\s*\\(");
+        Matcher inputReads = inputReadPattern.matcher(maskCommentsAndLiterals(scannerImportFree));
+        List<Integer> inputReadOffsets = new java.util.ArrayList<>();
+        while (inputReads.find()) inputReadOffsets.add(inputReads.start());
+        Pattern closePattern = Pattern.compile("\\b" + scannerAlternation + "\\s*\\.\\s*close\\s*\\(\\s*\\)\\s*;");
+        Matcher sourceCloseMatcher = closePattern.matcher(maskCommentsAndLiterals(scannerImportFree));
+        while (sourceCloseMatcher.find()) {
+            int closeOffset = sourceCloseMatcher.start();
+            if (inputReadOffsets.stream().anyMatch(readOffset -> readOffset > closeOffset)) {
+                return scannerFailure(source, "CB-JAVA-SCANNER-CLOSED-READ",
+                        "Java closes System.in when a Scanner is closed; a later Scanner read is invalid and cannot be mapped to the shared C++ input stream.",
+                        closeOffset);
+            }
+        }
         String rewritten = applyTextEdits(scannerImportFree, declarationEdits);
         Pattern primitiveRead = Pattern.compile("\\b(int|long|float|double|String)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*"
                 + scannerAlternation + "\\s*\\.\\s*next(Int|Long|Float|Double|Line|)?\\s*\\(\\s*\\)\\s*;");
@@ -182,8 +205,7 @@ public final class JavaParser implements LanguageParser {
                     + "; __codebridge_read_" + markerType + "(" + name + ");"));
         }
         rewritten = applyTextEdits(rewritten, readEdits);
-        Pattern close = Pattern.compile("\\b" + scannerAlternation + "\\s*\\.\\s*close\\s*\\(\\s*\\)\\s*;");
-        Matcher closeMatcher = close.matcher(maskCommentsAndLiterals(rewritten));
+        Matcher closeMatcher = closePattern.matcher(maskCommentsAndLiterals(rewritten));
         List<TextEdit> closeEdits = new java.util.ArrayList<>();
         while (closeMatcher.find()) closeEdits.add(new TextEdit(closeMatcher.start(), closeMatcher.end(),
                 blankSourceRange(rewritten, closeMatcher.start(), closeMatcher.end()).substring(closeMatcher.start(), closeMatcher.end())));
@@ -217,6 +239,40 @@ public final class JavaParser implements LanguageParser {
             for (int i = matcher.start(); i < matcher.end(); i++)
                 if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
             for (int i = 0; i < replacement.length(); i++) rewritten[offset + i] = replacement.charAt(i);
+        }
+        return new String(rewritten);
+    }
+
+    /** Rewrites explicit current-instance member access to its equivalent unqualified class member form. */
+    private String normalizeThisQualifiedMembers(String source) {
+        Matcher matcher = Pattern.compile("\\bthis\\s*\\.\\s*").matcher(maskCommentsAndLiterals(source));
+        char[] rewritten = source.toCharArray();
+        while (matcher.find()) {
+            for (int i = matcher.start(); i < matcher.end(); i++)
+                if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
+        }
+        return new String(rewritten);
+    }
+
+    /** Removes the declaring class qualifier only for known static fields and methods. */
+    private String normalizeClassQualifiedStaticAccess(String source, String className, JavaFrontendModel model) {
+        java.util.Set<String> staticMembers = new java.util.LinkedHashSet<>();
+        for (JavaFrontendModel.MemberModel member : model.types().getFirst().members()) {
+            if (member.modifiers().contains("static")
+                    && (member.kind().equals("FIELD") || member.kind().equals("METHOD"))) {
+                staticMembers.add(member.name());
+            }
+        }
+        if (staticMembers.isEmpty()) return source;
+        String names = staticMembers.stream().map(Pattern::quote)
+                .collect(java.util.stream.Collectors.joining("|", "(?:", ")"));
+        Matcher matcher = Pattern.compile("\\b" + Pattern.quote(className) + "\\s*\\.\\s*(" + names + ")\\b")
+                .matcher(maskCommentsAndLiterals(source));
+        char[] rewritten = source.toCharArray();
+        while (matcher.find()) {
+            int memberStart = matcher.start(1);
+            for (int i = matcher.start(); i < memberStart; i++)
+                if (rewritten[i] != '\n' && rewritten[i] != '\r') rewritten[i] = ' ';
         }
         return new String(rewritten);
     }
@@ -342,7 +398,7 @@ public final class JavaParser implements LanguageParser {
     }
 
     private LoweredJavaProgram attachInstanceMethods(com.tascode.codebridge.ir.Program program,
-                                                    FieldExtraction extraction, String source) {
+                                                    FieldExtraction extraction, String source, JavaFrontendModel model) {
         if (extraction.instanceMethods().isEmpty()) {
             return new LoweredJavaProgram(new com.tascode.codebridge.ir.Program(program.irVersion(), program.sourceSpan(),
                     program.functions(), program.includes(), extraction.globals(), program.enums(), extraction.classes()), List.of());
@@ -352,11 +408,15 @@ public final class JavaParser implements LanguageParser {
         List<Diagnostic> diagnostics = new java.util.ArrayList<>();
         for (JavaFrontendModel.MemberModel member : extraction.instanceMethods()) {
             String memberSource = sourceSlice(source, member.sourceSpan());
+            memberSource = normalizeClassQualifiedStaticAccess(memberSource, extraction.classes().getFirst().name(), model);
+            memberSource = normalizeThisQualifiedMembers(memberSource);
             String memberSyntax = maskCommentsAndLiterals(memberSource);
-            if (Pattern.compile("\\bString\\b|\\bSystem\\s*\\.|\\b[A-Za-z_$][\\w$]*\\s*\\.\\s*[A-Za-z_$][\\w$]*")
-                    .matcher(memberSyntax).find()) {
+            String qualifiedAccessCheck = memberSyntax.replaceAll(
+                    "\\bSystem\\s*\\.\\s*out\\s*\\.\\s*(?:print|println|printf)\\s*(?=\\()", " ");
+            if (Pattern.compile("\\bString\\b|\\b[A-Za-z_$][\\w$]*\\s*\\.\\s*[A-Za-z_$][\\w$]*")
+                    .matcher(qualifiedAccessCheck).find()) {
                 diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-JAVA-INSTANCE-MEMBER-ACCESS-UNSUPPORTED",
-                        "Instance methods currently support primitive state and unqualified same-class calls only; Java library calls and qualified member access need explicit mappings.", member.sourceSpan()));
+                        "Instance methods support primitive state, same-class calls, and basic System.out output; other Java library calls and qualified member access need explicit mappings.", member.sourceSpan()));
                 continue;
             }
             if (!member.hasBody()) {

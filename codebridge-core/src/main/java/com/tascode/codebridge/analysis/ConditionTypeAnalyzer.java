@@ -95,12 +95,14 @@ public final class ConditionTypeAnalyzer {
             boolean equality = op.equals("==") || op.equals("!=");
             boolean relational = Set.of("<", ">", "<=", ">=").contains(op);
             boolean bitwise = Set.of("&", "|", "^", "<<", ">>").contains(op);
+            boolean booleanBitwise = from == Language.JAVA && to == Language.CPP
+                    && Set.of("&", "|", "^").contains(op) && left.equals("bool") && right.equals("bool");
             boolean integralOperands = Set.of("byte", "int", "long", "short", "char").contains(left)
                     && Set.of("byte", "int", "long", "short", "char").contains(right);
             if (logical && !(left.equals("bool") && right.equals("bool"))
                     && !(from != Language.JAVA && scalar(left) && scalar(right))) {
                 error("CB-TYPE-BOOLEAN-OPERANDS", "Logical operator '" + op + "' requires boolean operands.", binary, diagnostics);
-            } else if (bitwise && !integralOperands) {
+            } else if (bitwise && !integralOperands && !booleanBitwise) {
                 error("CB-TYPE-INTEGRAL-OPERANDS", "Bitwise and shift operators require integral operands.", binary, diagnostics);
             } else if (relational && !(NUMERIC.contains(left) && NUMERIC.contains(right))) {
                 error("CB-TYPE-NUMERIC-OPERANDS", "Comparison '" + op + "' requires numeric operands.", binary, diagnostics);
@@ -144,6 +146,7 @@ public final class ConditionTypeAnalyzer {
             if (literal.value() instanceof String) return "string";
         } else if (expression instanceof NameExpression name) return variables.getOrDefault(name.name(), "unknown");
         else if (expression instanceof CallExpression call) {
+            if (call.callee().equals("__codebridge_array_length")) return "int";
             if (call.callee().endsWith(".equals")) return "bool";
             return variables.getOrDefault("@function:" + call.callee(), "unknown");
         }
@@ -154,6 +157,8 @@ public final class ConditionTypeAnalyzer {
         else if (expression instanceof BinaryExpression binary) {
             if (Set.of("==", "!=", "<", ">", "<=", ">=", "&&", "||").contains(binary.operator())) return "bool";
             String left = typeOf(binary.left(), variables), right = typeOf(binary.right(), variables);
+            if (Set.of("&", "|", "^").contains(binary.operator()) && left.equals("bool") && right.equals("bool")) return "bool";
+            if (Set.of("<<", ">>").contains(binary.operator())) return Set.of("byte", "short", "char").contains(left) ? "int" : left;
             if (NUMERIC.contains(left) && NUMERIC.contains(right)) return "int";
             if (binary.operator().equals("+") && left.equals("string") && right.equals("string")) return "string";
         } else if (expression instanceof UnaryExpression unary) return unary.operator().equals("!") ? "bool" : typeOf(unary.operand(), variables);

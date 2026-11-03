@@ -137,6 +137,14 @@ public final class SubsetFunctionParser implements LanguageParser {
             if ((name.equals("std::cout") || name.equals("cout")) && match("<<"))
                 return new CallExpression(V, span(token, previous()), "__codebridge_cout", streamArguments());
             if (match("(")) return new CallExpression(V, span(token, previous()), name, callArguments(name));
+            int memberSeparator = name.indexOf('.');
+            if (language == Language.JAVA && memberSeparator > 0
+                    && name.indexOf('.', memberSeparator + 1) < 0
+                    && name.substring(memberSeparator + 1).equals("length")
+                    && !knownTypes.contains(name.substring(0, memberSeparator))) {
+                NameExpression array = new NameExpression(V, token.span(), name.substring(0, memberSeparator));
+                return new CallExpression(V, span(token, previous()), "__codebridge_array_length", List.of(array));
+            }
             if (qualified && (language != Language.JAVA || name.contains("::") || name.indexOf('.') != name.lastIndexOf('.')))
                 throw fail("qualified values are supported only for a single Java object field access", token);
             NameExpression expression = new NameExpression(V, qualified ? span(token, previous()) : token.span(), name);

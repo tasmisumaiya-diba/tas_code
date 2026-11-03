@@ -1,3 +1,3 @@
 package com.tascode.codebridge.ir;
 import com.tascode.codebridge.diagnostic.SourceSpan;
-public sealed interface IrNode permits Expression, Statement, Program, FunctionDeclaration, Parameter, TypeReference, TypeParameter, GlobalVariableDeclaration, EnumDeclaration, EnumDeclaration.Enumerator, ClassDeclaration, FieldDeclaration, MethodDeclaration, ConstructorDeclaration { int irVersion(); SourceSpan sourceSpan(); }
+public sealed interface IrNode permits Expression, Statement, IrType, Program, FunctionDeclaration, Parameter, TypeReference, TypeParameter, GlobalVariableDeclaration, EnumDeclaration, EnumDeclaration.Enumerator, ClassDeclaration, FieldDeclaration, MethodDeclaration, ConstructorDeclaration, SwitchStatement.Case, TryStatement.Catch { int irVersion(); SourceSpan sourceSpan(); }

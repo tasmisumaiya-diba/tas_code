@@ -83,7 +83,11 @@ public final class SymbolAnalyzer {
 
     private void analyzeExpression(Expression expression, Deque<Set<String>> scopes, List<Diagnostic> diagnostics) {
         if (expression instanceof NameExpression name) {
-            if (scopes.stream().noneMatch(scope -> scope.contains(name.name()))) {
+            String identifier = name.name();
+            int member = identifier.indexOf('.');
+            boolean objectMember = member > 0 && identifier.indexOf('.', member + 1) < 0
+                    && scopes.stream().anyMatch(scope -> scope.contains(identifier.substring(0, member)));
+            if (!objectMember && scopes.stream().noneMatch(scope -> scope.contains(identifier))) {
                 diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-SYMBOL-UNRESOLVED",
                         "Name '" + name.name() + "' is not declared in this function.", name.sourceSpan()));
             }

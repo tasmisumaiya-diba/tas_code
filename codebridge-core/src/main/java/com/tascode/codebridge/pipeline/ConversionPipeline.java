@@ -121,16 +121,16 @@ public final class ConversionPipeline {
                         "Java instance fields require class and object representation, which the C target does not support.", type.sourceSpan())));
             }
         }
-        if (!diagnostics.isEmpty()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
+        if (hasErrors(diagnostics)) return new ConversionResult(from, to, Optional.empty(), diagnostics);
         diagnostics.addAll(semanticDiagnostics);
-        if (!diagnostics.isEmpty()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
+        if (hasErrors(diagnostics)) return new ConversionResult(from, to, Optional.empty(), diagnostics);
         for (String feature : featureAnalyzer.requiredFeatures(root)) {
             if (!targetModule.capabilities().supports(feature)) {
                 diagnostics.add(Diagnostic.at(Severity.ERROR, "CB-UNSUP-FEATURE",
                         "The target language does not support the required feature '" + feature + "'.", root.sourceSpan()));
             }
         }
-        if (!diagnostics.isEmpty()) return new ConversionResult(from, to, Optional.empty(), diagnostics);
+        if (hasErrors(diagnostics)) return new ConversionResult(from, to, Optional.empty(), diagnostics);
         RuleContext context = new RuleContext(from, to);
         try {
             for (ConversionRule rule : rules) if (rule.appliesTo(from, to, root)) root = Objects.requireNonNull(rule.rewrite(root, context), "Rule returned null IR");
@@ -141,5 +141,9 @@ public final class ConversionPipeline {
         LanguageGenerator.GenerationResult generated = targetModule.generator().generate(root);
         diagnostics.addAll(generated.diagnostics());
         return new ConversionResult(from, to, generated.successful() ? Optional.of(generated.source()) : Optional.empty(), diagnostics);
+    }
+
+    private boolean hasErrors(List<Diagnostic> diagnostics) {
+        return diagnostics.stream().anyMatch(diagnostic -> diagnostic.severity() == Severity.ERROR);
     }
 }

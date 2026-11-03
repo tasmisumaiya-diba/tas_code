@@ -11,3 +11,4 @@ Math	sqrt	1	std::sqrt
 Math	pow	2	std::pow
 Math	floor	1	std::floor
 Math	ceil	1	std::ceil
+Math	abs	1	std::abs
